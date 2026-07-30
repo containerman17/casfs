@@ -152,11 +152,13 @@ mtime is kept in the LRU entry, so the throttle check costs no stat and the
 common hit does no extra syscall at all. The seed is then stale by at most one
 interval.
 
-The cost ceiling is one `utimes` per chunk per interval, which is driven by
-distinct hot chunks, not by read volume. At 50GB/hour of hot reads with the
-default 4MB chunk that is 12,800 chunks per hour, under four `utimes` per
-second, and the kernel batches the inode writeback anyway. Smaller chunks scale
-it linearly; the knob is there if a workload ever makes it matter.
+The cost ceiling is one `utimes` per chunk per interval, driven by the number
+of distinct hot chunks, not by read volume. A 50GB hot set at the default 4MB
+chunk is 12,800 chunks; touched once each that is under four `utimes` per
+second, and continuously re-read at the 10-minute throttle it tops out at six
+touches per chunk per hour, about 21 per second. Either way the kernel batches
+the inode writeback. Smaller chunks scale it linearly; the knob is there if a
+workload ever makes it matter.
 
 ## Dependency choice
 
