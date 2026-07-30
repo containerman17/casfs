@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 func newStore(t *testing.T, f *fakeS3, prefix string, chunkSize, cacheBytes int64) *Store {
@@ -516,6 +517,142 @@ func TestTornTmpRecovery(t *testing.T) {
 	}
 	if s2.CacheUsage() != int64(len(data)) {
 		t.Fatalf("recovered cache usage %d, want %d", s2.CacheUsage(), len(data))
+	}
+}
+
+func mtimeOf(t *testing.T, path string) time.Time {
+	t.Helper()
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return fi.ModTime()
+}
+
+// TestTouchOnReadIsThrottled proves a cache hit refreshes a chunk's mtime at
+// most once per TouchInterval, however hard the chunk is read.
+func TestTouchOnReadIsThrottled(t *testing.T) {
+	f := newFakeS3(t)
+	// The interval sits well clear of this filesystem's 4ms mtime granularity.
+	const cs, interval = 1024, 50 * time.Millisecond
+	s := newStore(t, f, "", cs, 1<<20)
+	s.cfg.TouchInterval = interval // set before any concurrent use
+	data := randBytes(cs*3, 20)
+	hash := f.seed("", data)
+
+	file, err := s.Open(hash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	p := make([]byte, 8)
+	if _, err := file.ReadAt(p, 0); err != nil { // fills chunk 0
+		t.Fatal(err)
+	}
+	path := s.chunkPath(chunkKey(hash, 0))
+	first := mtimeOf(t, path)
+
+	for i := 0; i < 50; i++ { // all inside the interval, all hits
+		if _, err := file.ReadAt(p, int64(i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := mtimeOf(t, path); !got.Equal(first) {
+		t.Fatalf("mtime moved %v within the throttle interval", got.Sub(first))
+	}
+
+	time.Sleep(interval + interval/2)
+	if _, err := file.ReadAt(p, 0); err != nil {
+		t.Fatal(err)
+	}
+	second := mtimeOf(t, path)
+	if !second.After(first) {
+		t.Fatal("mtime did not advance after the throttle interval elapsed")
+	}
+	for i := 0; i < 50; i++ {
+		if _, err := file.ReadAt(p, int64(i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := mtimeOf(t, path); !got.Equal(second) {
+		t.Fatalf("mtime moved again within the interval, by %v", got.Sub(second))
+	}
+
+	// Negative disables it outright.
+	s.cfg.TouchInterval = -1
+	time.Sleep(interval + interval/2)
+	if _, err := file.ReadAt(p, 0); err != nil {
+		t.Fatal(err)
+	}
+	if got := mtimeOf(t, path); !got.Equal(second) {
+		t.Fatal("negative TouchInterval still touched the chunk")
+	}
+}
+
+// TestTouchKeepsRestartSeedFresh is the reason touching exists: a chunk fetched
+// long ago but read constantly must outrank a newer chunk nobody reads once the
+// process restarts and the LRU is reseeded from mtime. Ages are planted rather
+// than slept out, since mtime granularity here is 4ms.
+func TestTouchKeepsRestartSeedFresh(t *testing.T) {
+	f := newFakeS3(t)
+	const cs = 1024
+	s := newStore(t, f, "", cs, 1<<20)
+	data := randBytes(cs*2, 21)
+	hash := f.seed("", data)
+
+	file, err := s.Open(hash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := make([]byte, 8)
+	for _, off := range []int64{0, cs} { // fill both chunks
+		if _, err := file.ReadAt(p, off); err != nil {
+			t.Fatal(err)
+		}
+	}
+	file.Close()
+
+	// Chunk 0 is the older of the two on disk, and is about to become the hot
+	// one. Chunk 1 is newer and never read again.
+	hot, cold := s.chunkPath(chunkKey(hash, 0)), s.chunkPath(chunkKey(hash, 1))
+	now := time.Now()
+	for path, age := range map[string]time.Duration{hot: 2 * time.Hour, cold: time.Hour} {
+		if err := os.Chtimes(path, now.Add(-age), now.Add(-age)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Restart: the LRU is reseeded from those mtimes, so chunk 0 starts last in
+	// line. One read is enough to lift it, at the default TouchInterval.
+	s2 := reopen(t, s)
+	file2, err := s2.Open(hash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file2.Close()
+	if _, err := file2.ReadAt(p, 0); err != nil {
+		t.Fatal(err)
+	}
+	if !mtimeOf(t, hot).After(mtimeOf(t, cold)) {
+		t.Fatal("touch did not lift the hot chunk above the cold one")
+	}
+
+	// Restart again with room for exactly one chunk. The seed must keep the
+	// touched one, which without touching would have been evicted first.
+	cfg := s2.cfg
+	cfg.CacheBytes = cs
+	s3, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(hot); err != nil {
+		t.Fatalf("restart evicted the touched chunk: %v", err)
+	}
+	if _, err := os.Stat(cold); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("restart kept the untouched chunk: %v", err)
+	}
+	if s3.CacheUsage() != cs {
+		t.Fatalf("post-restart usage %d, want %d", s3.CacheUsage(), cs)
 	}
 }
 

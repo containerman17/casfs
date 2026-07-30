@@ -71,6 +71,10 @@ s, err := casfs.New(casfs.Config{
     CacheDir:   "/var/lib/app/chunks",
     CacheBytes: 8 << 30,
     ChunkSize:  4 << 20,   // default
+
+    // How often a cache hit may refresh a chunk's mtime, which is what the
+    // startup LRU seed reads. 0 means 10 minutes, negative disables it.
+    TouchInterval: 10 * time.Minute,
 })
 
 path := s.SpoolPath(hash)       // rename your finished file onto this, yourself
@@ -134,6 +138,25 @@ Evicting means unlinking a whole chunk file, nothing else. Readers hold an open
 handle to the chunk they are reading, and a POSIX unlink does not disturb an
 open file, so eviction never races a read. Spool files are outside the cache
 entirely: they are never evicted, and only `Release` removes one.
+
+### Throttled touch on read
+
+The in-memory LRU is the live authority. But it dies with the process, and the
+restart seed comes from mtime, so a chunk fetched three days ago and read every
+second since would look ancient to a fresh process and be evicted first,
+exactly backwards.
+
+So a cache hit also refreshes the chunk file's mtime, throttled to at most once
+per `TouchInterval` (default 10 minutes, negative disables it). The last written
+mtime is kept in the LRU entry, so the throttle check costs no stat and the
+common hit does no extra syscall at all. The seed is then stale by at most one
+interval.
+
+The cost ceiling is one `utimes` per chunk per interval, which is driven by
+distinct hot chunks, not by read volume. At 50GB/hour of hot reads with the
+default 4MB chunk that is 12,800 chunks per hour, under four `utimes` per
+second, and the kernel batches the inode writeback anyway. Smaller chunks scale
+it linearly; the knob is there if a workload ever makes it matter.
 
 ## Dependency choice
 

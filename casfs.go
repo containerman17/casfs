@@ -36,7 +36,12 @@ import (
 	"time"
 )
 
-const DefaultChunkSize = 4 << 20
+const (
+	DefaultChunkSize = 4 << 20
+	// DefaultTouchInterval bounds how stale the restart LRU seed can be. See
+	// Config.TouchInterval.
+	DefaultTouchInterval = 10 * time.Minute
+)
 
 type Config struct {
 	Endpoint  string // scheme://host[:port], path-style, no bucket
@@ -51,12 +56,20 @@ type Config struct {
 	CacheBytes int64  // hard cap on chunk bytes on disk
 	ChunkSize  int64  // chunk granularity, default DefaultChunkSize
 
+	// TouchInterval throttles how often a cache hit refreshes a chunk file's
+	// mtime. The startup LRU seed reads mtime, so without this a chunk fetched
+	// long ago but read constantly looks ancient after a restart and gets
+	// evicted first. Zero means DefaultTouchInterval, negative disables
+	// touching entirely.
+	TouchInterval time.Duration
+
 	HTTPClient *http.Client // optional
 }
 
 type chunk struct {
 	key   string // "<hash>.<index>"
 	bytes int64
+	mtime time.Time // last value written to the file, not necessarily read back
 }
 
 type Store struct {
@@ -88,6 +101,9 @@ func New(cfg Config) (*Store, error) {
 	}
 	if cfg.ChunkSize <= 0 {
 		cfg.ChunkSize = DefaultChunkSize
+	}
+	if cfg.TouchInterval == 0 {
+		cfg.TouchInterval = DefaultTouchInterval
 	}
 	if cfg.Region == "" {
 		cfg.Region = "auto"
@@ -159,7 +175,7 @@ func (s *Store) scanCache() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, f := range all { // oldest first, so PushFront leaves newest at the front
-		s.idx[f.key] = s.lru.PushFront(&chunk{f.key, f.bytes})
+		s.idx[f.key] = s.lru.PushFront(&chunk{f.key, f.bytes, f.mtime})
 		s.used += f.bytes
 	}
 	s.evictLocked()
@@ -428,16 +444,34 @@ func (s *Store) admit(key string, n int64, hash string, total int64) {
 		s.lru.MoveToFront(el)
 		return
 	}
-	s.idx[key] = s.lru.PushFront(&chunk{key, n})
+	s.idx[key] = s.lru.PushFront(&chunk{key, n, time.Now()})
 	s.used += n
 	s.evictLocked()
 }
 
+// touch marks a chunk as recently used. The in-memory LRU is the live
+// authority; the mtime write exists only so a restart reseeds sensibly, and is
+// throttled to at most one utimes per chunk per TouchInterval. The recorded
+// mtime is kept in the LRU entry, so a hit never needs a stat.
 func (s *Store) touch(key string) {
+	now := time.Now()
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	if el, ok := s.idx[key]; ok {
-		s.lru.MoveToFront(el)
+	el, ok := s.idx[key]
+	if !ok {
+		s.mu.Unlock()
+		return
+	}
+	s.lru.MoveToFront(el)
+	c := el.Value.(*chunk)
+	stale := s.cfg.TouchInterval > 0 && now.Sub(c.mtime) >= s.cfg.TouchInterval
+	if stale {
+		c.mtime = now
+	}
+	s.mu.Unlock()
+	if stale {
+		// Best effort. A failed utimes costs restart fidelity, nothing else,
+		// and the chunk may legitimately have been evicted a moment ago.
+		os.Chtimes(s.chunkPath(key), now, now)
 	}
 }
 
