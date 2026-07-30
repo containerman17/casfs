@@ -73,8 +73,8 @@ s, err := casfs.New(casfs.Config{
     ChunkSize:  4 << 20,   // default
 
     // How often a cache hit may refresh a chunk's mtime, which is what the
-    // startup LRU seed reads. 0 means 10 minutes, negative disables it.
-    TouchInterval: 10 * time.Minute,
+    // startup LRU seed reads. 0 means 1 hour, negative disables it.
+    TouchInterval: time.Hour,
 })
 
 path := s.SpoolPath(hash)       // rename your finished file onto this, yourself
@@ -147,7 +147,7 @@ second since would look ancient to a fresh process and be evicted first,
 exactly backwards.
 
 So a cache hit also refreshes the chunk file's mtime, throttled to at most once
-per `TouchInterval` (default 10 minutes, negative disables it). The last written
+per `TouchInterval` (default 1 hour, negative disables it). The last written
 mtime is kept in the LRU entry, so the throttle check costs no stat and the
 common hit does no extra syscall at all. The seed is then stale by at most one
 interval.
@@ -155,8 +155,8 @@ interval.
 The cost ceiling is one `utimes` per chunk per interval, driven by the number
 of distinct hot chunks, not by read volume. A 50GB hot set at the default 4MB
 chunk is 12,800 chunks; touched once each that is under four `utimes` per
-second, and continuously re-read at the 10-minute throttle it tops out at six
-touches per chunk per hour, about 21 per second. Either way the kernel batches
+second, and continuously re-read at the 1-hour throttle it tops out at one
+touch per chunk per hour, about 3.6 per second. Either way the kernel batches
 the inode writeback. Smaller chunks scale it linearly; the knob is there if a
 workload ever makes it matter.
 

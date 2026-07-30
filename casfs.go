@@ -40,7 +40,7 @@ const (
 	DefaultChunkSize = 4 << 20
 	// DefaultTouchInterval bounds how stale the restart LRU seed can be. See
 	// Config.TouchInterval.
-	DefaultTouchInterval = 10 * time.Minute
+	DefaultTouchInterval = time.Hour
 )
 
 type Config struct {
