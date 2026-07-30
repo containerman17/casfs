@@ -11,11 +11,16 @@
 // does not already have. The durable copy is the spool file or the bucket,
 // never the chunk cache, which is disposable by construction.
 //
-// There is exactly one read path: the chunk cache. A chunk miss is filled by
-// pread from the spool file when it is still there, or by a ranged GET when it
-// is not, and that is the only difference between the two. Either way the chunk
-// is materialized as an ordinary cache file, counted against the cache cap and
-// evicted like any other.
+// There is exactly one read path: the chunk cache. Each artifact is cached as
+// ONE SPARSE FILE of its full size, and a chunk is filled by pwriting it at its
+// true offset, from the spool file when it is still there or by a ranged GET
+// when it is not. Presence is the kernel's extent map, read back with
+// SEEK_DATA; eviction is FALLOC_FL_PUNCH_HOLE on one chunk's range. Because the
+// file is whole and correctly sized, a consumer can mmap it and let the kernel
+// tier RAM to SSD while casfs tiers SSD to S3, which is what File.View hands
+// out.
+//
+// Linux only: the sparse layout has no portable analogue and no fallback.
 package casfs
 
 import (
@@ -41,6 +46,10 @@ const (
 	// DefaultTouchInterval bounds how stale the restart LRU seed can be. See
 	// Config.TouchInterval.
 	DefaultTouchInterval = time.Hour
+	// cleanMarker is written by Close and removed by New. Its absence means the
+	// last process died without flushing, so the cache is wiped. See the crash
+	// safety section of the README.
+	cleanMarker = ".clean"
 )
 
 type Config struct {
@@ -52,25 +61,53 @@ type Config struct {
 	SecretKey string
 
 	SpoolDir   string // hash-named files awaiting upload, created if missing
-	CacheDir   string // chunk files, created if missing
-	CacheBytes int64  // hard cap on chunk bytes on disk
+	CacheDir   string // one sparse file per artifact, created if missing
+	CacheBytes int64  // hard cap on cached chunk bytes on disk
 	ChunkSize  int64  // chunk granularity, default DefaultChunkSize
 
-	// TouchInterval throttles how often a cache hit refreshes a chunk file's
-	// mtime. The startup LRU seed reads mtime, so without this a chunk fetched
-	// long ago but read constantly looks ancient after a restart and gets
-	// evicted first. Zero means DefaultTouchInterval, negative disables
+	// TouchInterval throttles how often a cache hit refreshes an artifact's
+	// mtime. The startup LRU seed reads mtime, so without this an artifact
+	// fetched long ago but read constantly looks ancient after a restart and
+	// gets evicted first. Zero means DefaultTouchInterval, negative disables
 	// touching entirely.
 	TouchInterval time.Duration
 
 	HTTPClient *http.Client // optional
 }
 
+// chunk is one cache entry. The LRU stays keyed by (hash, index) even though
+// the bytes now live inside a shared sparse file, because that is still the
+// granularity of a fill and of a punch.
 type chunk struct {
-	key   string // "<hash>.<index>"
+	hash  string
+	idx   int64
 	bytes int64
-	mtime time.Time // last value written to the file, not necessarily read back
 }
+
+// artifact is the per-hash cache state: the sparse file, which chunks of it are
+// present, and which chunks may not be punched right now.
+type artifact struct {
+	hash string
+	size int64
+	// f is assigned under Store.mu and never reassigned once set, so the read
+	// and write paths may use it without holding the lock. Only Close clears
+	// it, and using a Store after Close is a caller bug.
+	f *os.File // O_RDWR on the sparse file, opened on demand
+
+	present []uint64        // one bit per chunk
+	pins    map[int64]int32 // chunk index -> live pins, absent means zero
+	mtime   time.Time       // last mtime written to the file, not read back
+}
+
+func (a *artifact) has(i int64) bool    { return a.present[i/64]&(1<<(i%64)) != 0 }
+func (a *artifact) set(i int64)         { a.present[i/64] |= 1 << (i % 64) }
+func (a *artifact) clear(i int64)       { a.present[i/64] &^= 1 << (i % 64) }
+func (a *artifact) pinned(i int64) bool { return a.pins[i] > 0 }
+
+func nchunks(size, cs int64) int64 { return (size + cs - 1) / cs }
+
+// chunkLen is the length of chunk i, short for the last one.
+func chunkLen(size, cs, i int64) int64 { return min(cs, size-i*cs) }
 
 type Store struct {
 	cfg Config
@@ -81,6 +118,7 @@ type Store struct {
 	// costs one HEAD each.
 	sizes     map[string]int64
 	confirmed map[string]bool
+	arts      map[string]*artifact
 	lru       *list.List // front = most recently used, values are *chunk
 	idx       map[string]*list.Element
 	used      int64
@@ -128,8 +166,12 @@ func New(cfg Config) (*Store, error) {
 		},
 		sizes:     map[string]int64{},
 		confirmed: map[string]bool{},
+		arts:      map[string]*artifact{},
 		lru:       list.New(),
 		idx:       map[string]*list.Element{},
+	}
+	if err := s.reclaim(); err != nil {
+		return nil, err
 	}
 	if err := s.scanCache(); err != nil {
 		return nil, err
@@ -137,26 +179,43 @@ func New(cfg Config) (*Store, error) {
 	return s, nil
 }
 
-// scanCache rebuilds the in-memory LRU from the cache directory, deleting torn
-// tmp files left behind by a crash. Recency is seeded from mtime, which is
-// approximate and good enough.
-func (s *Store) scanCache() error {
-	type found struct {
-		key   string
-		bytes int64
-		mtime time.Time
+// reclaim decides whether the cache dir may be trusted at all. Close writes the
+// clean marker after flushing every artifact; if it is missing, some pwrite may
+// have been half-flushed when the process died, and a half-written extent still
+// reads as present. There is no way to tell, so the whole cache goes. It is
+// disposable by construction and this costs refills, never correctness.
+func (s *Store) reclaim() error {
+	marker := filepath.Join(s.cfg.CacheDir, cleanMarker)
+	if _, err := os.Stat(marker); err == nil {
+		return os.Remove(marker)
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return err
 	}
-	var all []found
+	ents, err := os.ReadDir(s.cfg.CacheDir)
+	if err != nil {
+		return err
+	}
+	for _, e := range ents {
+		if err := os.RemoveAll(filepath.Join(s.cfg.CacheDir, e.Name())); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// scanCache rebuilds the in-memory LRU from the cache directory. Presence comes
+// from each sparse file's extent map, recency from its mtime, which is now one
+// timestamp for the whole artifact. Anything that is not a hash-named artifact
+// file is deleted, which is also how a pre-sparse cache directory is retired.
+func (s *Store) scanCache() error {
+	var all []*artifact
 	err := filepath.WalkDir(s.cfg.CacheDir, func(p string, d fs.DirEntry, err error) error {
 		if err != nil || d.IsDir() {
 			return err
 		}
 		name := d.Name()
-		if strings.Contains(name, ".tmp") {
+		if !validHash(name) || filepath.Base(filepath.Dir(p)) != name[:2] {
 			return os.Remove(p)
-		}
-		if !validChunkName(name) {
-			return nil
 		}
 		fi, err := d.Info()
 		if err != nil {
@@ -165,7 +224,11 @@ func (s *Store) scanCache() error {
 			}
 			return err
 		}
-		all = append(all, found{name, fi.Size(), fi.ModTime()})
+		a, err := s.scanArtifact(name, fi)
+		if err != nil {
+			return err
+		}
+		all = append(all, a)
 		return nil
 	})
 	if err != nil {
@@ -174,12 +237,50 @@ func (s *Store) scanCache() error {
 	sort.Slice(all, func(i, j int) bool { return all[i].mtime.Before(all[j].mtime) })
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for _, f := range all { // oldest first, so PushFront leaves newest at the front
-		s.idx[f.key] = s.lru.PushFront(&chunk{f.key, f.bytes, f.mtime})
-		s.used += f.bytes
+	for _, a := range all { // oldest first, so PushFront leaves newest at the front
+		s.arts[a.hash] = a
+		// The cache file was created at the object's full size, so a restart
+		// learns every cached object's size without a HEAD.
+		s.sizes[a.hash] = a.size
+		for i := int64(0); i < nchunks(a.size, s.cfg.ChunkSize); i++ {
+			if a.has(i) {
+				s.admitLocked(a.hash, i, chunkLen(a.size, s.cfg.ChunkSize, i))
+			}
+		}
 	}
 	s.evictLocked()
 	return nil
+}
+
+// scanArtifact reads one sparse file's extent map into a presence bitmap. Only
+// a chunk whose whole range is reported as data counts as present, so the
+// kernel's licence to overstate data can only ever cost a refill.
+func (s *Store) scanArtifact(hash string, fi fs.FileInfo) (*artifact, error) {
+	f, err := os.Open(s.cachePath(hash))
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	cs := s.cfg.ChunkSize
+	a := &artifact{
+		hash:    hash,
+		size:    fi.Size(),
+		present: make([]uint64, (nchunks(fi.Size(), cs)+63)/64),
+		pins:    map[int64]int32{},
+		mtime:   fi.ModTime(),
+	}
+	n := nchunks(a.size, cs)
+	err = dataRanges(f, a.size, func(off, end int64) {
+		for i := off / cs; i < n && i*cs < end; i++ {
+			if i*cs >= off && i*cs+chunkLen(a.size, cs, i) <= end {
+				a.set(i)
+			}
+		}
+	})
+	if err != nil {
+		return nil, err
+	}
+	return a, nil
 }
 
 func validHash(h string) bool {
@@ -195,15 +296,6 @@ func validHash(h string) bool {
 	return true
 }
 
-func validChunkName(name string) bool {
-	i := strings.IndexByte(name, '.')
-	if i < 0 || !validHash(name[:i]) {
-		return false
-	}
-	_, err := strconv.ParseInt(name[i+1:], 10, 64)
-	return err == nil
-}
-
 func (s *Store) key(hash string) string { return s.cfg.Prefix + hash }
 
 // SpoolPath is where a file named after hash must land to be registered.
@@ -213,12 +305,13 @@ func (s *Store) SpoolPath(hash string) string {
 	return filepath.Join(s.cfg.SpoolDir, hash)
 }
 
-func chunkKey(hash string, idx int64) string {
-	return hash + "." + strconv.FormatInt(idx, 10)
+// cachePath is the sparse file holding whatever of hash is cached.
+func (s *Store) cachePath(hash string) string {
+	return filepath.Join(s.cfg.CacheDir, hash[:2], hash)
 }
 
-func (s *Store) chunkPath(key string) string {
-	return filepath.Join(s.cfg.CacheDir, key[:2], key)
+func chunkKey(hash string, idx int64) string {
+	return hash + "." + strconv.FormatInt(idx, 10)
 }
 
 // Put hashes a local file and renames it into the spool under its hash. The
@@ -350,6 +443,29 @@ func (s *Store) Release(hash string) error {
 	return nil
 }
 
+// Close flushes every cached artifact and marks the cache clean, so the next
+// New may trust it. Skipping it, or dying before it, costs the whole cache and
+// nothing else. It does not invalidate open Files, but their Views are only
+// stable while their ranges stay pinned, exactly as during normal operation.
+func (s *Store) Close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var errs []error
+	for _, a := range s.arts {
+		if a.f == nil {
+			continue
+		}
+		// Order matters: the marker must not become visible before the data it
+		// vouches for is on disk.
+		errs = append(errs, a.f.Sync(), a.f.Close())
+		a.f = nil
+	}
+	if err := errors.Join(errs...); err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(s.cfg.CacheDir, cleanMarker), nil, 0o644)
+}
+
 // Open returns a reader for hash. The content must be in the spool or in the
 // bucket. The only network call Open itself may make is a HEAD to learn the size
 // of an object that is neither spooled nor already known to this process.
@@ -358,7 +474,7 @@ func (s *Store) Open(hash string) (*File, error) {
 		return nil, fmt.Errorf("casfs: open %q: not a hex sha256", hash)
 	}
 	if fi, err := os.Stat(s.SpoolPath(hash)); err == nil {
-		return &File{s: s, hash: hash, size: fi.Size()}, nil
+		return &File{s: s, hash: hash, size: fi.Size(), spooled: true}, nil
 	}
 	s.mu.Lock()
 	size, known := s.sizes[hash]
@@ -375,114 +491,210 @@ func (s *Store) Open(hash string) (*File, error) {
 	return &File{s: s, hash: hash, size: size}, nil
 }
 
-// openChunk returns an open handle to chunk idx of hash, filling the cache if
-// it is missing. The handle stays valid even if the chunk is evicted
-// immediately afterwards, because a POSIX unlink does not disturb open files.
-func (s *Store) openChunk(hash string, idx int64) (*os.File, error) {
-	key := chunkKey(hash, idx)
-	f, err := os.Open(s.chunkPath(key))
-	if err == nil {
-		s.touch(key)
-		return f, nil
+// artifact returns the cache state for hash, creating the sparse file at its
+// full size if it is not there yet.
+//
+// ponytail: one descriptor per artifact read since startup, never closed until
+// Close. Bounded by the number of distinct artifacts, not chunks, which is what
+// this store is for; add an fd LRU if some caller ever opens thousands.
+func (s *Store) artifact(hash string, size int64) (*artifact, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	a := s.arts[hash]
+	if a != nil && a.size != size {
+		// Cannot happen from this code: the name is the content hash. Some
+		// foreign file is squatting the path, so it is not a cache entry.
+		s.forgetLocked(a)
+		a = nil
 	}
-	if !errors.Is(err, fs.ErrNotExist) {
-		return nil, err
+	if a == nil {
+		a = &artifact{
+			hash:    hash,
+			size:    size,
+			present: make([]uint64, (nchunks(size, s.cfg.ChunkSize)+63)/64),
+			pins:    map[int64]int32{},
+			mtime:   time.Now(),
+		}
+		s.arts[hash] = a
 	}
-	return s.fill(hash, idx, key)
-}
-
-// fill produces a missing chunk. The spool file is preferred when it is still
-// present, which is the only respect in which spooled and remote content differ.
-func (s *Store) fill(hash string, idx int64, key string) (*os.File, error) {
-	if sf, err := os.Open(s.SpoolPath(hash)); err == nil {
-		defer sf.Close()
-		fi, err := sf.Stat()
+	if a.f == nil {
+		if err := os.MkdirAll(filepath.Dir(s.cachePath(hash)), 0o755); err != nil {
+			return nil, err
+		}
+		f, err := s.fileLocked(a)
 		if err != nil {
 			return nil, err
 		}
-		return s.materialize(hash, idx, key,
-			io.NewSectionReader(sf, idx*s.cfg.ChunkSize, s.cfg.ChunkSize), fi.Size())
+		if err := f.Truncate(size); err != nil { // the whole length, holes for the rest
+			return nil, err
+		}
 	}
-	body, total, err := s.s3.get(s.key(hash), idx*s.cfg.ChunkSize, s.cfg.ChunkSize)
-	if err != nil {
-		return nil, err
-	}
-	defer body.Close()
-	return s.materialize(hash, idx, key, body, total)
+	return a, nil
 }
 
-// materialize writes one chunk as tmp+rename and admits it to the cache. It
-// returns a handle to the published chunk that survives the chunk's eviction.
-func (s *Store) materialize(hash string, idx int64, key string, src io.Reader, total int64) (*os.File, error) {
-	final := s.chunkPath(key)
-	if err := os.MkdirAll(filepath.Dir(final), 0o755); err != nil {
-		return nil, err
+// fileLocked returns the artifact's descriptor, opening the sparse file if this
+// process has not needed it yet. Eviction needs one as much as a fill does: a
+// punch is a write.
+func (s *Store) fileLocked(a *artifact) (*os.File, error) {
+	if a.f == nil {
+		f, err := os.OpenFile(s.cachePath(a.hash), os.O_RDWR|os.O_CREATE, 0o644)
+		if err != nil {
+			return nil, err
+		}
+		a.f = f
 	}
-	tmp, err := os.CreateTemp(filepath.Dir(final), key+".tmp")
-	if err != nil {
-		return nil, err
-	}
-	n, err := io.Copy(tmp, io.LimitReader(src, s.cfg.ChunkSize))
-	if err == nil {
-		err = os.Rename(tmp.Name(), final)
-	}
-	if err != nil {
-		tmp.Close()
-		os.Remove(tmp.Name())
-		return nil, err
-	}
-	s.admit(key, n, hash, total)
-	return tmp, nil
+	return a.f, nil
 }
 
-// admit records a newly published chunk and evicts down to the byte cap.
-func (s *Store) admit(key string, n int64, hash string, total int64) {
+// forgetLocked drops every trace of an artifact, cache file included.
+func (s *Store) forgetLocked(a *artifact) {
+	for el := s.lru.Front(); el != nil; {
+		next := el.Next()
+		if c := el.Value.(*chunk); c.hash == a.hash {
+			s.lru.Remove(el)
+			delete(s.idx, chunkKey(c.hash, c.idx))
+			s.used -= c.bytes
+		}
+		el = next
+	}
+	if a.f != nil {
+		a.f.Close()
+	}
+	delete(s.arts, a.hash)
+	os.Remove(s.cachePath(a.hash))
+}
+
+// hold makes chunk idx present and pins it. The pin covers the fill as well as
+// whatever the caller does next, which is what keeps a concurrent eviction from
+// punching the range out from under either. Every hold needs a drop.
+func (s *Store) hold(a *artifact, idx int64) error {
+	s.mu.Lock()
+	a.pins[idx]++
+	have := a.has(idx)
+	stale := have && s.hitLocked(a, idx)
+	s.mu.Unlock()
+	if stale {
+		// Best effort. A failed utimes costs restart fidelity, nothing else.
+		now := time.Now()
+		os.Chtimes(s.cachePath(a.hash), now, now)
+	}
+	if have {
+		return nil
+	}
+	if err := s.fill(a, idx); err != nil {
+		s.drop(a, idx)
+		return err
+	}
+	return nil
+}
+
+func (s *Store) drop(a *artifact, idx int64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.sizes[hash] = total
+	if a.pins[idx] <= 1 {
+		delete(a.pins, idx)
+	} else {
+		a.pins[idx]--
+	}
+	if s.used > s.cfg.CacheBytes {
+		// A pin outranks the cap, so eviction can leave the cache over it. Try
+		// again as pins clear, or the cap only converges on the next fill.
+		s.evictLocked()
+	}
+}
+
+// fill pwrites one chunk into the sparse file at its true offset. The spool
+// file is preferred when it is still present, which is the only respect in
+// which spooled and remote content differ. Two goroutines filling the same
+// chunk both write the same bytes to the same place, which is why there is no
+// singleflight: a duplicate fill is correct, just wasteful.
+func (s *Store) fill(a *artifact, idx int64) error {
+	off := idx * s.cfg.ChunkSize
+	n := chunkLen(a.size, s.cfg.ChunkSize, idx)
+	var src io.Reader
+	if sf, err := os.Open(s.SpoolPath(a.hash)); err == nil {
+		defer sf.Close()
+		src = io.NewSectionReader(sf, off, n)
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return err
+	} else {
+		body, _, err := s.s3.get(s.key(a.hash), off, n)
+		if err != nil {
+			return err
+		}
+		defer body.Close()
+		src = body
+	}
+	w, err := io.Copy(io.NewOffsetWriter(a.f, off), io.LimitReader(src, n))
+	if err == nil && w != n {
+		err = fmt.Errorf("casfs: chunk %s.%d: got %d bytes, want %d: %w", a.hash, idx, w, n, io.ErrUnexpectedEOF)
+	}
+	if err != nil {
+		// A short fill is garbage that nothing will ever account for, so give
+		// the blocks back rather than leak them until some later refill.
+		punch(a.f, off, n)
+		return err
+	}
+	s.mu.Lock()
+	a.set(idx)
+	s.admitLocked(a.hash, idx, n)
+	s.evictLocked()
+	s.mu.Unlock()
+	return nil
+}
+
+// admitLocked records a chunk that is now on disk.
+func (s *Store) admitLocked(hash string, idx, n int64) {
+	key := chunkKey(hash, idx)
 	if el, ok := s.idx[key]; ok { // another goroutine filled it too
 		s.lru.MoveToFront(el)
 		return
 	}
-	s.idx[key] = s.lru.PushFront(&chunk{key, n, time.Now()})
+	s.idx[key] = s.lru.PushFront(&chunk{hash, idx, n})
 	s.used += n
-	s.evictLocked()
 }
 
-// touch marks a chunk as recently used. The in-memory LRU is the live
-// authority; the mtime write exists only so a restart reseeds sensibly, and is
-// throttled to at most one utimes per chunk per TouchInterval. The recorded
-// mtime is kept in the LRU entry, so a hit never needs a stat.
-func (s *Store) touch(key string) {
+// hitLocked marks a chunk as recently used and reports whether the artifact's
+// mtime is due for a refresh. The in-memory LRU is the live authority; the
+// mtime write exists only so a restart reseeds sensibly, and is throttled to at
+// most one utimes per artifact per TouchInterval.
+func (s *Store) hitLocked(a *artifact, idx int64) bool {
+	if el, ok := s.idx[chunkKey(a.hash, idx)]; ok {
+		s.lru.MoveToFront(el)
+	}
 	now := time.Now()
-	s.mu.Lock()
-	el, ok := s.idx[key]
-	if !ok {
-		s.mu.Unlock()
-		return
+	if s.cfg.TouchInterval > 0 && now.Sub(a.mtime) >= s.cfg.TouchInterval {
+		a.mtime = now
+		return true
 	}
-	s.lru.MoveToFront(el)
-	c := el.Value.(*chunk)
-	stale := s.cfg.TouchInterval > 0 && now.Sub(c.mtime) >= s.cfg.TouchInterval
-	if stale {
-		c.mtime = now
-	}
-	s.mu.Unlock()
-	if stale {
-		// Best effort. A failed utimes costs restart fidelity, nothing else,
-		// and the chunk may legitimately have been evicted a moment ago.
-		os.Chtimes(s.chunkPath(key), now, now)
-	}
+	return false
 }
 
+// evictLocked punches chunks, least recently used first, until the cache is
+// back under its cap. Pinned chunks are skipped, never punched: a caller
+// holding a live mmap of a range would silently start reading zeros, and there
+// is no error and no fault to notice it by.
 func (s *Store) evictLocked() {
-	for s.used > s.cfg.CacheBytes && s.lru.Len() > 0 {
-		el := s.lru.Back()
+	for el := s.lru.Back(); el != nil && s.used > s.cfg.CacheBytes; {
+		prev := el.Prev()
 		c := el.Value.(*chunk)
+		a := s.arts[c.hash]
+		if a != nil && a.pinned(c.idx) {
+			el = prev
+			continue
+		}
 		s.lru.Remove(el)
-		delete(s.idx, c.key)
+		delete(s.idx, chunkKey(c.hash, c.idx))
 		s.used -= c.bytes
-		os.Remove(s.chunkPath(c.key))
+		if a != nil {
+			a.clear(c.idx)
+			// Best effort: a failed punch leaves blocks allocated that the
+			// accounting no longer counts, and the next fill rewrites them.
+			if f, err := s.fileLocked(a); err == nil {
+				punch(f, c.idx*s.cfg.ChunkSize, c.bytes)
+			}
+		}
+		el = prev
 	}
 }
 
@@ -524,16 +736,186 @@ func checkPointer(name string) error {
 	return nil
 }
 
-// File reads one stored object. It holds no file descriptors, so Close is a
-// formality and reads remain valid for the life of the Store.
+// File reads one stored object, through the chunk cache with ReadAt or as a
+// zero-copy mapping with View. Close releases the mapping and any pins this
+// File still holds, and invalidates every View it handed out.
 type File struct {
-	s    *Store
-	hash string
-	size int64
+	s       *Store
+	hash    string
+	size    int64
+	spooled bool // opened while the spool file was still there
+
+	mu     sync.Mutex
+	a      *artifact
+	view   []byte          // whole-file PROT_READ mapping, created by View
+	myPins map[int64]int32 // this File's share of the artifact's pins
 }
 
-func (f *File) Size() int64  { return f.size }
-func (f *File) Close() error { return nil }
+func (f *File) Size() int64 { return f.size }
+
+func (f *File) art() (*artifact, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.a == nil {
+		a, err := f.s.artifact(f.hash, f.size)
+		if err != nil {
+			return nil, err
+		}
+		f.a = a
+	}
+	return f.a, nil
+}
+
+func (f *File) Close() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.a != nil {
+		for i, n := range f.myPins {
+			for ; n > 0; n-- {
+				f.s.drop(f.a, i)
+			}
+		}
+	}
+	f.myPins = nil
+	unmap(f.view)
+	f.view = nil
+	return nil
+}
+
+func (f *File) bounds(off, n int64) error {
+	if off < 0 || n < 0 || off+n > f.size {
+		return fmt.Errorf("casfs: range [%d,%d) outside a %d byte object", off, off+n, f.size)
+	}
+	return nil
+}
+
+// Pin declares that [off, off+n) must stay resident: eviction will not punch
+// any chunk it touches until the matching Unpin. Hold a pin for as long as a
+// View of that range is being read, because a punched page reads back as zeros
+// with no error, and zeros are indistinguishable from content.
+//
+// Pins live in memory only, so they die with the process, which is correct: a
+// mapping cannot outlive the process that holds it.
+func (f *File) Pin(off, n int64) error {
+	if err := f.bounds(off, n); err != nil || n == 0 {
+		return err
+	}
+	a, err := f.art()
+	if err != nil {
+		return err
+	}
+	cs := f.s.cfg.ChunkSize
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.s.mu.Lock()
+	defer f.s.mu.Unlock()
+	if f.myPins == nil {
+		f.myPins = map[int64]int32{}
+	}
+	for i := off / cs; i <= (off+n-1)/cs; i++ {
+		a.pins[i]++
+		f.myPins[i]++
+	}
+	return nil
+}
+
+// Unpin releases a range pinned by an earlier Pin on this same File. It reports
+// an error, and changes nothing, if any chunk in the range is not pinned here.
+func (f *File) Unpin(off, n int64) error {
+	if err := f.bounds(off, n); err != nil || n == 0 {
+		return err
+	}
+	cs := f.s.cfg.ChunkSize
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.s.mu.Lock()
+	defer f.s.mu.Unlock()
+	for i := off / cs; i <= (off+n-1)/cs; i++ {
+		if f.myPins[i] <= 0 {
+			return fmt.Errorf("casfs: unpin of an unpinned range [%d,%d)", off, off+n)
+		}
+	}
+	for i := off / cs; i <= (off+n-1)/cs; i++ {
+		f.myPins[i]--
+		if f.myPins[i] == 0 {
+			delete(f.myPins, i)
+		}
+		if f.a.pins[i] <= 1 {
+			delete(f.a.pins, i)
+		} else {
+			f.a.pins[i]--
+		}
+	}
+	if f.s.used > f.s.cfg.CacheBytes {
+		f.s.evictLocked() // a pin outranks the cap, so unpinning may owe blocks
+	}
+	return nil
+}
+
+// View returns a zero-copy read-only view of [off, off+n), filling any chunks
+// the range needs first. The bytes are a window onto a shared mapping of the
+// cache file, so the kernel tiers them between RAM and SSD by itself and
+// nothing is copied onto the Go heap.
+//
+// The bytes are only guaranteed to be there while the covering range is pinned,
+// and only until Close. An unpinned chunk can be evicted at any moment by a
+// hole punch, after which the same slice silently reads zeros. Pin first, read,
+// then Unpin.
+//
+// A spool-resident object is mapped straight from the spool file. Releasing it
+// afterwards does not disturb an existing mapping, because unlinking never
+// disturbs one.
+func (f *File) View(off, n int64) ([]byte, error) {
+	if err := f.bounds(off, n); err != nil {
+		return nil, err
+	}
+	if n == 0 {
+		return []byte{}, nil
+	}
+	f.mu.Lock()
+	spooled := f.spooled
+	if spooled && f.view == nil {
+		b, err := mapWhole(f.s.SpoolPath(f.hash), f.size)
+		switch {
+		case err == nil:
+			f.view = b
+		case errors.Is(err, fs.ErrNotExist):
+			f.spooled, spooled = false, false // released already, use the cache
+		default:
+			f.mu.Unlock()
+			return nil, err
+		}
+	}
+	if spooled {
+		defer f.mu.Unlock()
+		return f.view[off : off+n], nil
+	}
+	f.mu.Unlock()
+
+	// Fill outside the File lock, so concurrent Views of one object do not
+	// serialize behind each other's ranged GETs.
+	a, err := f.art()
+	if err != nil {
+		return nil, err
+	}
+	cs := f.s.cfg.ChunkSize
+	for i := off / cs; i <= (off+n-1)/cs; i++ {
+		if err := f.s.hold(a, i); err != nil {
+			return nil, err
+		}
+		f.s.drop(a, i) // the caller's own Pin is what keeps it, not this
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.view == nil {
+		b, err := mapWhole(f.s.cachePath(f.hash), f.size)
+		if err != nil {
+			return nil, err
+		}
+		f.view = b
+	}
+	return f.view[off : off+n], nil
+}
 
 func (f *File) ReadAt(p []byte, off int64) (int, error) {
 	if off < 0 {
@@ -545,18 +927,17 @@ func (f *File) ReadAt(p []byte, off int64) (int, error) {
 	if off >= f.size {
 		return 0, io.EOF
 	}
+	a, err := f.art()
+	if err != nil {
+		return 0, err
+	}
 	cs := f.s.cfg.ChunkSize
 	n := 0
 	for n < len(p) && off+int64(n) < f.size {
 		cur := off + int64(n)
-		cf, err := f.s.openChunk(f.hash, cur/cs)
-		if err != nil {
-			return n, err
-		}
-		m, err := cf.ReadAt(p[n:], cur%cs)
-		cf.Close()
+		m, err := f.s.readChunk(a, cur/cs, p[n:], cur%cs)
 		n += m
-		if err != nil && err != io.EOF {
+		if err != nil {
 			return n, err
 		}
 		if m == 0 {
@@ -567,4 +948,18 @@ func (f *File) ReadAt(p []byte, off int64) (int, error) {
 		return n, io.EOF
 	}
 	return n, nil
+}
+
+// readChunk preads out of one chunk, filling it first if it is missing. The
+// chunk stays pinned for the whole read, so an eviction racing this read cannot
+// turn it into a hole halfway through and hand back zeros.
+func (s *Store) readChunk(a *artifact, idx int64, p []byte, off int64) (int, error) {
+	if err := s.hold(a, idx); err != nil {
+		return 0, err
+	}
+	defer s.drop(a, idx)
+	// Clamp to the chunk: past its end lies the next chunk, which may be a
+	// hole, and a hole reads as zeros rather than as a short read.
+	want := min(int64(len(p)), chunkLen(a.size, s.cfg.ChunkSize, idx)-off)
+	return a.f.ReadAt(p[:want], idx*s.cfg.ChunkSize+off)
 }
