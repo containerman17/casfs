@@ -2,9 +2,20 @@
 // bucket, with lazy chunked reads and a byte-capped local disk cache.
 //
 // Objects are stored whole under their hex sha256, so uploads are idempotent
-// and two writers racing on the same content write identical bytes. Reads are
-// served from, in order: the original local file if it is still registered,
-// cached chunk files on disk, and finally ranged GETs against the bucket.
+// and two writers racing on the same content write identical bytes.
+//
+// Durability lives entirely in the filesystem. A caller adds content by
+// atomically renaming a file named after its hex sha256 into the store's spool
+// directory. That rename is the registration; there is no handshake to lose and
+// no other state anywhere. Sync scans the spool and uploads whatever the bucket
+// does not already have. The durable copy is the spool file or the bucket,
+// never the chunk cache, which is disposable by construction.
+//
+// There is exactly one read path: the chunk cache. A chunk miss is filled by
+// pread from the spool file when it is still there, or by a ranged GET when it
+// is not, and that is the only difference between the two. Either way the chunk
+// is materialized as an ordinary cache file, counted against the cache cap and
+// evicted like any other.
 package casfs
 
 import (
@@ -35,18 +46,12 @@ type Config struct {
 	AccessKey string
 	SecretKey string
 
-	CacheDir   string // directory for chunk files, created if missing
+	SpoolDir   string // hash-named files awaiting upload, created if missing
+	CacheDir   string // chunk files, created if missing
 	CacheBytes int64  // hard cap on chunk bytes on disk
-	ChunkSize  int64  // ranged GET granularity, default DefaultChunkSize
+	ChunkSize  int64  // chunk granularity, default DefaultChunkSize
 
 	HTTPClient *http.Client // optional
-}
-
-// entry is what the store knows about one hash.
-type entry struct {
-	size     int64
-	path     string // original local file, "" once released or never registered
-	uploaded bool
 }
 
 type chunk struct {
@@ -58,11 +63,14 @@ type Store struct {
 	cfg Config
 	s3  *s3
 
-	mu    sync.Mutex
-	files map[string]*entry
-	lru   *list.List // front = most recently used, values are *chunk
-	idx   map[string]*list.Element
-	used  int64
+	mu sync.Mutex
+	// sizes and confirmed are caches, never the source of truth. Losing them
+	// costs one HEAD each.
+	sizes     map[string]int64
+	confirmed map[string]bool
+	lru       *list.List // front = most recently used, values are *chunk
+	idx       map[string]*list.Element
+	used      int64
 }
 
 func New(cfg Config) (*Store, error) {
@@ -71,6 +79,8 @@ func New(cfg Config) (*Store, error) {
 		return nil, errors.New("casfs: Endpoint is required")
 	case cfg.Bucket == "":
 		return nil, errors.New("casfs: Bucket is required")
+	case cfg.SpoolDir == "":
+		return nil, errors.New("casfs: SpoolDir is required")
 	case cfg.CacheDir == "":
 		return nil, errors.New("casfs: CacheDir is required")
 	case cfg.CacheBytes <= 0:
@@ -85,8 +95,10 @@ func New(cfg Config) (*Store, error) {
 	if cfg.HTTPClient == nil {
 		cfg.HTTPClient = &http.Client{Timeout: 5 * time.Minute}
 	}
-	if err := os.MkdirAll(cfg.CacheDir, 0o755); err != nil {
-		return nil, err
+	for _, dir := range []string{cfg.SpoolDir, cfg.CacheDir} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return nil, err
+		}
 	}
 	s := &Store{
 		cfg: cfg,
@@ -98,20 +110,21 @@ func New(cfg Config) (*Store, error) {
 			sk:       cfg.SecretKey,
 			http:     cfg.HTTPClient,
 		},
-		files: map[string]*entry{},
-		lru:   list.New(),
-		idx:   map[string]*list.Element{},
+		sizes:     map[string]int64{},
+		confirmed: map[string]bool{},
+		lru:       list.New(),
+		idx:       map[string]*list.Element{},
 	}
-	if err := s.scan(); err != nil {
+	if err := s.scanCache(); err != nil {
 		return nil, err
 	}
 	return s, nil
 }
 
-// scan rebuilds the in-memory LRU from the cache directory, deleting torn tmp
-// files left behind by a crash. Recency is seeded from mtime, which is
+// scanCache rebuilds the in-memory LRU from the cache directory, deleting torn
+// tmp files left behind by a crash. Recency is seeded from mtime, which is
 // approximate and good enough.
-func (s *Store) scan() error {
+func (s *Store) scanCache() error {
 	type found struct {
 		key   string
 		bytes int64
@@ -177,68 +190,97 @@ func validChunkName(name string) bool {
 
 func (s *Store) key(hash string) string { return s.cfg.Prefix + hash }
 
+// SpoolPath is where a file named after hash must land to be registered.
+// Callers that produce content themselves can write next to it and rename onto
+// this path; that rename is all the registration there is.
+func (s *Store) SpoolPath(hash string) string {
+	return filepath.Join(s.cfg.SpoolDir, hash)
+}
+
+func chunkKey(hash string, idx int64) string {
+	return hash + "." + strconv.FormatInt(idx, 10)
+}
+
 func (s *Store) chunkPath(key string) string {
 	return filepath.Join(s.cfg.CacheDir, key[:2], key)
 }
 
-// Register hashes a local file and makes it readable through Open immediately,
-// served straight from that file. It performs no network I/O. The file must
-// stay where it is until Release, or until it is uploaded and the caller
-// removes it.
-func (s *Store) Register(path string) (string, error) {
+// Put hashes a local file and renames it into the spool under its hash. The
+// rename is atomic and is the entire registration, so a kill at any instant
+// leaves either the untouched original or a correctly named spool file that the
+// next Sync uploads. path must be on the same filesystem as SpoolDir.
+//
+// This is a convenience only. A caller that already knows the hash can do the
+// rename itself and never call into casfs at all.
+func (s *Store) Put(path string) (string, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return "", err
 	}
-	defer f.Close()
 	h := sha256.New()
 	n, err := io.Copy(h, f)
+	f.Close()
 	if err != nil {
 		return "", err
 	}
 	hash := hex.EncodeToString(h.Sum(nil))
-	abs, err := filepath.Abs(path)
-	if err != nil {
-		return "", err
+	if err := os.Rename(path, s.SpoolPath(hash)); err != nil {
+		return "", fmt.Errorf("casfs: spool %s: %w", hash, err)
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	e := s.files[hash]
-	if e == nil {
-		e = &entry{}
-		s.files[hash] = e
-	}
-	e.size, e.path = n, abs
+	s.sizes[hash] = n
+	s.mu.Unlock()
 	return hash, nil
 }
 
-// Upload pushes a registered hash to the bucket if it is not already there.
-// It is safe to call concurrently and repeatedly; racing writers store
-// identical bytes.
-func (s *Store) Upload(hash string) error {
-	s.mu.Lock()
-	e := s.files[hash]
-	var path string
-	var done bool
-	if e != nil {
-		path, done = e.path, e.uploaded
+// Sync scans the spool and uploads every file the bucket does not already have,
+// then returns the hashes now confirmed present in the bucket. Failures are
+// collected per file, so one bad entry does not stall the rest.
+//
+// Call it after Put, on a ticker, at startup, whenever. It is the only thing
+// that moves bytes out, and it is driven purely by what the spool directory
+// contains.
+func (s *Store) Sync() ([]string, error) {
+	ents, err := os.ReadDir(s.cfg.SpoolDir)
+	if err != nil {
+		return nil, err
 	}
-	s.mu.Unlock()
-	if done {
-		return nil
+	var done []string
+	var errs []error
+	for _, e := range ents {
+		hash := e.Name()
+		if e.IsDir() || !validHash(hash) {
+			continue
+		}
+		if err := s.upload(hash); err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		s.mu.Lock()
+		s.confirmed[hash] = true
+		s.mu.Unlock()
+		done = append(done, hash)
 	}
-	if path == "" {
-		return fmt.Errorf("casfs: upload %s: not registered", hash)
-	}
+	return done, errors.Join(errs...)
+}
 
-	if _, err := s.s3.head(s.key(hash)); err == nil {
-		s.markUploaded(hash)
+// upload pushes one spool file, hashing the bytes as they stream past so a file
+// whose name lies about its contents is caught without a separate pass over it.
+// That same digest is what the request signature commits to through
+// x-amz-content-sha256, so a compliant endpoint rejects the mismatched bytes
+// before storing them; the local check turns that into a legible error and
+// covers endpoints that do not verify.
+func (s *Store) upload(hash string) error {
+	if size, err := s.s3.head(s.key(hash)); err == nil {
+		s.mu.Lock()
+		s.sizes[hash] = size
+		s.mu.Unlock()
 		return nil
 	} else if !errors.Is(err, fs.ErrNotExist) {
 		return err
 	}
 
-	f, err := os.Open(path)
+	f, err := os.Open(s.SpoolPath(hash))
 	if err != nil {
 		return err
 	}
@@ -247,95 +289,81 @@ func (s *Store) Upload(hash string) error {
 	if err != nil {
 		return err
 	}
-	if err := s.s3.put(s.key(hash), f, fi.Size(), hash); err != nil {
-		return err
+	h := sha256.New()
+	putErr := s.s3.put(s.key(hash), io.TeeReader(f, h), fi.Size(), hash)
+	if got := hex.EncodeToString(h.Sum(nil)); got != hash {
+		return fmt.Errorf("casfs: spool file %s contains content hashing to %s, refusing it", hash, got)
 	}
-	s.markUploaded(hash)
+	if putErr != nil {
+		return putErr
+	}
+	s.mu.Lock()
+	s.sizes[hash] = fi.Size()
+	s.mu.Unlock()
 	return nil
 }
 
-func (s *Store) markUploaded(hash string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if e := s.files[hash]; e != nil {
-		e.uploaded = true
-	}
-}
-
-// Put is Register followed by Upload. It is synchronous: when it returns, the
-// content is in the bucket and Open(hash) works.
-func (s *Store) Put(path string) (string, error) {
-	hash, err := s.Register(path)
-	if err != nil {
-		return "", err
-	}
-	return hash, s.Upload(hash)
-}
-
-// Release deletes the original local file registered for hash and drops it
-// from the read path. It refuses to touch the file until the upload is
-// confirmed, so a hash is never left unreadable. Open keeps working afterwards
-// through the chunk cache and ranged GETs.
+// Release drops the spool file for hash. It refuses until the bucket is
+// confirmed to hold the content, so a hash is never left unreadable.
+//
+// It stays deliberately dumb: no pre-warming of the cache. Whatever real
+// traffic touched while the file was spool-resident is already sitting in the
+// chunk cache and keeps serving from there, so the transition is invisible for
+// the ranges anyone actually reads. Ranges nobody ever read are by definition
+// cold, and copying gigabytes of them into the cache would only evict hot
+// chunks belonging to other files. Those fall to ranged GETs on demand, which
+// is the intent, not a gap.
 func (s *Store) Release(hash string) error {
 	s.mu.Lock()
-	e := s.files[hash]
-	if e == nil || e.path == "" {
-		s.mu.Unlock()
-		return nil
-	}
-	if !e.uploaded {
-		s.mu.Unlock()
-		return fmt.Errorf("casfs: release %s: upload not complete", hash)
-	}
-	path := e.path
-	e.path = ""
+	ok := s.confirmed[hash]
 	s.mu.Unlock()
-	if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+	if !ok {
+		if _, err := s.s3.head(s.key(hash)); err != nil {
+			if errors.Is(err, fs.ErrNotExist) {
+				return fmt.Errorf("casfs: release %s: not uploaded yet", hash)
+			}
+			return err
+		}
+		s.mu.Lock()
+		s.confirmed[hash] = true
+		s.mu.Unlock()
+	}
+	if err := os.Remove(s.SpoolPath(hash)); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return err
 	}
 	return nil
 }
 
-// Open returns a reader for hash. The object must have been registered, put,
-// or already exist in the bucket. The only network call Open itself may make is
-// a HEAD to learn the size of an object this process has not seen before.
+// Open returns a reader for hash. The content must be in the spool or in the
+// bucket. The only network call Open itself may make is a HEAD to learn the size
+// of an object that is neither spooled nor already known to this process.
 func (s *Store) Open(hash string) (*File, error) {
 	if !validHash(hash) {
 		return nil, fmt.Errorf("casfs: open %q: not a hex sha256", hash)
 	}
+	if fi, err := os.Stat(s.SpoolPath(hash)); err == nil {
+		return &File{s: s, hash: hash, size: fi.Size()}, nil
+	}
 	s.mu.Lock()
-	e := s.files[hash]
+	size, known := s.sizes[hash]
 	s.mu.Unlock()
-	if e == nil {
-		size, err := s.s3.head(s.key(hash))
-		if err != nil {
+	if !known {
+		var err error
+		if size, err = s.s3.head(s.key(hash)); err != nil {
 			return nil, err
 		}
 		s.mu.Lock()
-		if s.files[hash] == nil {
-			s.files[hash] = &entry{size: size, uploaded: true}
-		}
-		e = s.files[hash]
+		s.sizes[hash] = size
 		s.mu.Unlock()
 	}
-	return &File{s: s, hash: hash, size: e.size}, nil
+	return &File{s: s, hash: hash, size: size}, nil
 }
 
-// localPath returns the registered original file for hash, if any.
-func (s *Store) localPath(hash string) string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if e := s.files[hash]; e != nil {
-		return e.path
-	}
-	return ""
-}
-
-// openChunk returns an open handle to chunk idx of hash, fetching it if the
-// cache does not have it. The handle stays valid even if the chunk is evicted
+// openChunk returns an open handle to chunk idx of hash, filling the cache if
+// it is missing. The handle stays valid even if the chunk is evicted
 // immediately afterwards, because a POSIX unlink does not disturb open files.
 func (s *Store) openChunk(hash string, idx int64) (*os.File, error) {
-	key := hash + "." + strconv.FormatInt(idx, 10)
+	key := chunkKey(hash, idx)
 	f, err := os.Open(s.chunkPath(key))
 	if err == nil {
 		s.touch(key)
@@ -344,33 +372,45 @@ func (s *Store) openChunk(hash string, idx int64) (*os.File, error) {
 	if !errors.Is(err, fs.ErrNotExist) {
 		return nil, err
 	}
-	return s.fetch(hash, idx, key)
+	return s.fill(hash, idx, key)
 }
 
-func (s *Store) fetch(hash string, idx int64, key string) (*os.File, error) {
-	final := s.chunkPath(key)
-	if err := os.MkdirAll(filepath.Dir(final), 0o755); err != nil {
-		return nil, err
+// fill produces a missing chunk. The spool file is preferred when it is still
+// present, which is the only respect in which spooled and remote content differ.
+func (s *Store) fill(hash string, idx int64, key string) (*os.File, error) {
+	if sf, err := os.Open(s.SpoolPath(hash)); err == nil {
+		defer sf.Close()
+		fi, err := sf.Stat()
+		if err != nil {
+			return nil, err
+		}
+		return s.materialize(hash, idx, key,
+			io.NewSectionReader(sf, idx*s.cfg.ChunkSize, s.cfg.ChunkSize), fi.Size())
 	}
 	body, total, err := s.s3.get(s.key(hash), idx*s.cfg.ChunkSize, s.cfg.ChunkSize)
 	if err != nil {
 		return nil, err
 	}
 	defer body.Close()
+	return s.materialize(hash, idx, key, body, total)
+}
 
+// materialize writes one chunk as tmp+rename and admits it to the cache. It
+// returns a handle to the published chunk that survives the chunk's eviction.
+func (s *Store) materialize(hash string, idx int64, key string, src io.Reader, total int64) (*os.File, error) {
+	final := s.chunkPath(key)
+	if err := os.MkdirAll(filepath.Dir(final), 0o755); err != nil {
+		return nil, err
+	}
 	tmp, err := os.CreateTemp(filepath.Dir(final), key+".tmp")
 	if err != nil {
 		return nil, err
 	}
-	n, err := io.Copy(tmp, io.LimitReader(body, s.cfg.ChunkSize))
-	if err != nil {
-		tmp.Close()
-		os.Remove(tmp.Name())
-		return nil, err
+	n, err := io.Copy(tmp, io.LimitReader(src, s.cfg.ChunkSize))
+	if err == nil {
+		err = os.Rename(tmp.Name(), final)
 	}
-	// Keep the handle: after the rename it refers to the published chunk, and
-	// it survives eviction of that name.
-	if err := os.Rename(tmp.Name(), final); err != nil {
+	if err != nil {
 		tmp.Close()
 		os.Remove(tmp.Name())
 		return nil, err
@@ -383,12 +423,8 @@ func (s *Store) fetch(hash string, idx int64, key string) (*os.File, error) {
 func (s *Store) admit(key string, n int64, hash string, total int64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if e := s.files[hash]; e != nil {
-		e.size = total
-	} else {
-		s.files[hash] = &entry{size: total, uploaded: true}
-	}
-	if el, ok := s.idx[key]; ok { // another goroutine fetched it too
+	s.sizes[hash] = total
+	if el, ok := s.idx[key]; ok { // another goroutine filled it too
 		s.lru.MoveToFront(el)
 		return
 	}
@@ -416,7 +452,8 @@ func (s *Store) evictLocked() {
 	}
 }
 
-// CacheUsage reports the chunk bytes currently accounted for on disk.
+// CacheUsage reports the chunk bytes currently accounted for on disk. Spool
+// files are not counted: they are durable, not cache.
 func (s *Store) CacheUsage() int64 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -474,16 +511,6 @@ func (f *File) ReadAt(p []byte, off int64) (int, error) {
 	if off >= f.size {
 		return 0, io.EOF
 	}
-	// Tier zero: the original local file, whole and unchunked.
-	if path := f.s.localPath(f.hash); path != "" {
-		if lf, err := os.Open(path); err == nil {
-			n, err := lf.ReadAt(p, off)
-			lf.Close()
-			return n, err
-		}
-		// Released underneath us; fall through to the chunk path.
-	}
-
 	cs := f.s.cfg.ChunkSize
 	n := 0
 	for n < len(p) && off+int64(n) < f.size {

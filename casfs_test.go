@@ -2,7 +2,6 @@ package casfs
 
 import (
 	"bytes"
-	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -14,18 +13,19 @@ import (
 	"strings"
 	"sync"
 	"testing"
-	"time"
 )
 
 func newStore(t *testing.T, f *fakeS3, prefix string, chunkSize, cacheBytes int64) *Store {
 	t.Helper()
+	root := t.TempDir()
 	s, err := New(Config{
 		Endpoint:   f.URL,
 		Bucket:     f.bucket,
 		Prefix:     prefix,
 		AccessKey:  "minioadmin",
 		SecretKey:  "minioadmin",
-		CacheDir:   filepath.Join(t.TempDir(), "cache"),
+		SpoolDir:   filepath.Join(root, "spool"),
+		CacheDir:   filepath.Join(root, "cache"),
 		CacheBytes: cacheBytes,
 		ChunkSize:  chunkSize,
 	})
@@ -35,12 +35,11 @@ func newStore(t *testing.T, f *fakeS3, prefix string, chunkSize, cacheBytes int6
 	return s
 }
 
-// reopen builds a second Store over the same cache directory, standing in for a
-// process restart.
+// reopen builds a second Store over the same spool and cache directories,
+// standing in for a process restart.
 func reopen(t *testing.T, s *Store) *Store {
 	t.Helper()
-	cfg := s.cfg
-	s2, err := New(cfg)
+	s2, err := New(s.cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -53,13 +52,32 @@ func randBytes(n int, seed int64) []byte {
 	return b
 }
 
-func writeFile(t *testing.T, data []byte) string {
+// writeFile drops data in a scratch dir on the same filesystem as the spool, so
+// Put can rename it.
+func writeFile(t *testing.T, s *Store, data []byte) string {
 	t.Helper()
-	p := filepath.Join(t.TempDir(), "blob.bin")
+	dir := filepath.Join(filepath.Dir(s.cfg.SpoolDir), "incoming")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	p := filepath.Join(dir, "blob.bin")
 	if err := os.WriteFile(p, data, 0o644); err != nil {
 		t.Fatal(err)
 	}
 	return p
+}
+
+// spool writes data straight into the spool dir under a chosen name, with no
+// library call at all. That rename is the whole registration protocol.
+func spool(t *testing.T, s *Store, name string, data []byte) {
+	t.Helper()
+	tmp := filepath.Join(s.cfg.SpoolDir, ".staging")
+	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(tmp, s.SpoolPath(name)); err != nil {
+		t.Fatal(err)
+	}
 }
 
 // seed drops content straight into the fake bucket, so the store has never seen
@@ -73,6 +91,11 @@ func (f *fakeS3) seed(prefix string, data []byte) string {
 	return h
 }
 
+func hashOf(data []byte) string {
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
+}
+
 func readAll(t *testing.T, file *File) []byte {
 	t.Helper()
 	got, err := io.ReadAll(io.NewSectionReader(file, 0, file.Size()))
@@ -80,6 +103,31 @@ func readAll(t *testing.T, file *File) []byte {
 		t.Fatal(err)
 	}
 	return got
+}
+
+func mustSync(t *testing.T, s *Store) []string {
+	t.Helper()
+	done, err := s.Sync()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return done
+}
+
+// wipeCache clears the chunk cache and returns a restarted store, which is what
+// full eviction of a hash's chunks looks like from the read path.
+func wipeCache(t *testing.T, s *Store) *Store {
+	t.Helper()
+	ents, err := os.ReadDir(s.cfg.CacheDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range ents {
+		if err := os.RemoveAll(filepath.Join(s.cfg.CacheDir, e.Name())); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return reopen(t, s)
 }
 
 // TestSigningKeyVector pins the SigV4 key derivation to the published AWS
@@ -98,13 +146,15 @@ func TestRoundTripMultiChunk(t *testing.T) {
 	s := newStore(t, f, "epoch/", 4096, 1<<20)
 
 	data := randBytes(4096*7+123, 1)
-	hash, err := s.Put(writeFile(t, data))
+	hash, err := s.Put(writeFile(t, s, data))
 	if err != nil {
 		t.Fatal(err)
 	}
-	sum := sha256.Sum256(data)
-	if hash != hex.EncodeToString(sum[:]) {
-		t.Fatalf("Put returned %s, want %x", hash, sum)
+	if hash != hashOf(data) {
+		t.Fatalf("Put returned %s, want %s", hash, hashOf(data))
+	}
+	if done := mustSync(t, s); len(done) != 1 || done[0] != hash {
+		t.Fatalf("Sync confirmed %v, want [%s]", done, hash)
 	}
 	if err := s.Release(hash); err != nil {
 		t.Fatal(err)
@@ -122,7 +172,7 @@ func TestRoundTripMultiChunk(t *testing.T) {
 		t.Fatal("round trip bytes differ")
 	}
 
-	// A fresh Store over a cold cache must reproduce the same bytes.
+	// A fresh store with an empty spool and a cold cache must reproduce it.
 	s2 := newStore(t, f, "epoch/", 4096, 1<<20)
 	file2, err := s2.Open(hash)
 	if err != nil {
@@ -154,10 +204,7 @@ func TestReadAtCrossesChunkBoundaries(t *testing.T) {
 			}
 			p := make([]byte, span)
 			n, err := file.ReadAt(p, int64(off))
-			want := len(data) - off
-			if want > span {
-				want = span
-			}
+			want := min(len(data)-off, span)
 			if n != want {
 				t.Fatalf("ReadAt(off=%d,len=%d) n=%d, want %d", off, span, n, want)
 			}
@@ -206,80 +253,176 @@ func TestCacheHitNeedsNoNetwork(t *testing.T) {
 	}
 }
 
-// TestTierZeroToChunkTransition is the contract: from Put onward the hash is
-// readable, first straight off the original local file with no network at all,
-// and after Release through the chunk cache, byte for byte the same.
-func TestTierZeroToChunkTransition(t *testing.T) {
+// TestSpoolRenameSurvivesRestart is the durability contract: a hash-named file
+// renamed into the spool with no library call whatsoever is readable, and the
+// next process to start up uploads it. Nothing else is recorded anywhere, so
+// there is no ack that a kill can lose.
+func TestSpoolRenameSurvivesRestart(t *testing.T) {
 	f := newFakeS3(t)
-	s := newStore(t, f, "", 4096, 1<<20)
+	s := newStore(t, f, "v1/", 1024, 1<<20)
+	data := randBytes(1024*4+9, 10)
+	hash := hashOf(data)
+	spool(t, s, hash, data)
 
-	data := randBytes(4096*6+11, 4)
-	path := writeFile(t, data)
+	// The kill: this store never learns anything about the file.
+	restarted := reopen(t, s)
 
-	hash, err := s.Register(path)
+	file, err := restarted.Open(hash)
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Readable before the upload even starts, with zero network calls.
-	if f.count("GET")+f.count("HEAD")+f.count("PUT") != 0 {
-		t.Fatal("Register touched the network")
+	if f.count("HEAD")+f.count("GET") != 0 {
+		t.Fatal("Open of a spooled hash touched the network")
 	}
-	early, err := s.Open(hash)
-	if err != nil {
-		t.Fatal(err)
+	if got := readAll(t, file); !bytes.Equal(got, data) {
+		t.Fatal("spooled bytes differ")
 	}
-	if got := readAll(t, early); !bytes.Equal(got, data) {
-		t.Fatal("pre-upload read differs")
-	}
-	early.Close()
+	file.Close()
 	if f.count("GET") != 0 {
-		t.Fatalf("pre-upload read issued %d GETs", f.count("GET"))
+		t.Fatalf("reading a spooled file issued %d GETs", f.count("GET"))
 	}
 
-	// The original may not be dropped before the upload is confirmed.
-	if err := s.Release(hash); err == nil {
-		t.Fatal("Release succeeded before Upload")
+	done := mustSync(t, restarted)
+	if len(done) != 1 || done[0] != hash {
+		t.Fatalf("Sync after restart confirmed %v, want [%s]", done, hash)
 	}
-	if _, err := os.Stat(path); err != nil {
-		t.Fatalf("Release removed the original early: %v", err)
+	f.mu.Lock()
+	stored := f.objects["v1/"+hash]
+	f.mu.Unlock()
+	if !bytes.Equal(stored, data) {
+		t.Fatal("uploaded object differs from the spool file")
+	}
+}
+
+// TestSpoolNameMismatchRejected proves the name is verified against the bytes
+// as they stream, and that the endpoint refuses to store them.
+func TestSpoolNameMismatchRejected(t *testing.T) {
+	f := newFakeS3(t)
+	s := newStore(t, f, "", 1024, 1<<20)
+
+	honest := randBytes(2000, 11)
+	liar := hashOf(randBytes(2000, 12)) // a name that does not describe the bytes
+	spool(t, s, liar, honest)
+	good := hashOf(honest)
+	spool(t, s, good, honest)
+
+	done, err := s.Sync()
+	if err == nil {
+		t.Fatal("Sync accepted a spool file whose name lies about its contents")
+	}
+	if !strings.Contains(err.Error(), liar) {
+		t.Fatalf("error does not name the offending file: %v", err)
+	}
+	// The honest neighbour still went up: one bad entry must not stall the rest.
+	if len(done) != 1 || done[0] != good {
+		t.Fatalf("Sync confirmed %v, want [%s]", done, good)
+	}
+	f.mu.Lock()
+	_, stored := f.objects[liar]
+	f.mu.Unlock()
+	if stored {
+		t.Fatal("mismatched content was stored under the claimed hash")
+	}
+	if err := s.Release(liar); err == nil {
+		t.Fatal("Release dropped a spool file that was never uploaded")
+	}
+	if _, err := os.Stat(s.SpoolPath(liar)); err != nil {
+		t.Fatalf("rejected spool file was removed: %v", err)
+	}
+}
+
+// TestSpoolToRemoteTransition walks the whole lifecycle through the single read
+// path. Ranges read while the file is spool-resident are filled by pread and
+// land in the chunk cache like any other chunk, so Release changes nothing for
+// them. Only genuinely cold ranges, once the chunks are gone, reach S3.
+func TestSpoolToRemoteTransition(t *testing.T) {
+	f := newFakeS3(t)
+	const cs = 4096
+	s := newStore(t, f, "", cs, 1<<20)
+
+	data := randBytes(cs*6+11, 4)
+	path := writeFile(t, s, data)
+	hash, err := s.Put(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(path); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("Put left the original in place: %v", err)
+	}
+	if f.count("GET")+f.count("HEAD")+f.count("PUT") != 0 {
+		t.Fatal("Put touched the network")
 	}
 
-	const off, span = 4096*2 - 17, 4096*2 + 33
-	want := make([]byte, span)
 	file, err := s.Open(hash)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer file.Close()
-	if _, err := file.ReadAt(want, off); err != nil {
+
+	const hotOff, hotSpan = cs*2 - 17, cs*2 + 33 // straddles three chunks
+	hot := make([]byte, hotSpan)
+	if _, err := file.ReadAt(hot, hotOff); err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Equal(want, data[off:off+span]) {
-		t.Fatal("tier zero read differs from source")
+	if !bytes.Equal(hot, data[hotOff:hotOff+hotSpan]) {
+		t.Fatal("spool-resident read differs from source")
 	}
 	if f.count("GET") != 0 {
-		t.Fatal("tier zero read went to the network")
+		t.Fatal("spool-resident read went to the network")
+	}
+	// The pread went through the chunk cache like everything else.
+	if s.CacheUsage() == 0 {
+		t.Fatal("spool-resident read did not populate the chunk cache")
 	}
 
-	if err := s.Upload(hash); err != nil {
-		t.Fatal(err)
+	// The spool file is the durable copy until the upload is confirmed.
+	if err := s.Release(hash); err == nil {
+		t.Fatal("Release succeeded before Sync")
 	}
+	if _, err := os.Stat(s.SpoolPath(hash)); err != nil {
+		t.Fatalf("failed Release removed the spool file: %v", err)
+	}
+
+	mustSync(t, s)
 	if err := s.Release(hash); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(path); !errors.Is(err, fs.ErrNotExist) {
-		t.Fatalf("Release left the original in place: %v", err)
+	if _, err := os.Stat(s.SpoolPath(hash)); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("Release left the spool file behind: %v", err)
 	}
 
-	got := make([]byte, span)
-	if _, err := file.ReadAt(got, off); err != nil {
+	// Warm chunks survive Release, so the transition is invisible.
+	before := f.count("GET")
+	again := make([]byte, hotSpan)
+	if _, err := file.ReadAt(again, hotOff); err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Equal(got, want) {
-		t.Fatal("post-release read differs from tier zero read")
+	if !bytes.Equal(again, hot) {
+		t.Fatal("post-release read of a warm range differs")
 	}
-	if f.count("GET") == 0 {
-		t.Fatal("post-release read never reached S3")
+	if f.count("GET") != before {
+		t.Fatalf("warm range went to S3 after Release: %d GETs", f.count("GET")-before)
+	}
+
+	// Once those chunks are evicted, and only then, S3 serves the bytes.
+	s2 := wipeCache(t, s)
+	file2, err := s2.Open(hash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file2.Close()
+	cold := make([]byte, hotSpan)
+	if _, err := file2.ReadAt(cold, hotOff); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(cold, hot) {
+		t.Fatal("post-eviction read differs")
+	}
+	if f.count("GET") <= before {
+		t.Fatal("post-eviction read never reached S3")
+	}
+	if got := readAll(t, file2); !bytes.Equal(got, data) {
+		t.Fatal("whole file differs after eviction")
 	}
 }
 
@@ -304,10 +447,7 @@ func TestEvictionUnderConcurrentReaders(t *testing.T) {
 			defer file.Close()
 			for i := 0; i < 150; i++ {
 				off := rng.Intn(len(data))
-				span := 1 + rng.Intn(3*chunkSize)
-				if off+span > len(data) {
-					span = len(data) - off
-				}
+				span := min(1+rng.Intn(3*chunkSize), len(data)-off)
 				p := make([]byte, span)
 				if _, err := file.ReadAt(p, int64(off)); err != nil {
 					t.Errorf("ReadAt(%d,%d): %v", off, span, err)
@@ -340,8 +480,8 @@ func TestEvictionUnderConcurrentReaders(t *testing.T) {
 	}
 }
 
-// TestTornTmpRecovery plants the debris a crash mid-fetch would leave and
-// proves a restart cleans it up and still reads correctly.
+// TestTornTmpRecovery plants the debris a crash mid-fill would leave and proves
+// a restart cleans it up and still reads correctly.
 func TestTornTmpRecovery(t *testing.T) {
 	f := newFakeS3(t)
 	s := newStore(t, f, "", 1024, 1<<20)
@@ -357,8 +497,7 @@ func TestTornTmpRecovery(t *testing.T) {
 	}
 	file.Close()
 
-	dir := filepath.Join(s.cfg.CacheDir, hash[:2])
-	torn := filepath.Join(dir, hash+".2.tmp918273")
+	torn := filepath.Join(s.cfg.CacheDir, hash[:2], hash+".2.tmp918273")
 	if err := os.WriteFile(torn, []byte("half a chunk, then the power went out"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -404,73 +543,39 @@ func TestPointers(t *testing.T) {
 	}
 }
 
-func TestUploadIsIdempotent(t *testing.T) {
+func TestSyncIsIdempotent(t *testing.T) {
 	f := newFakeS3(t)
 	s := newStore(t, f, "", 1024, 1<<20)
-	path := writeFile(t, randBytes(3000, 7))
+	data := randBytes(3000, 7)
+	hash := hashOf(data)
+	spool(t, s, hash, data)
 
-	h1, err := s.Put(path)
-	if err != nil {
-		t.Fatal(err)
-	}
+	mustSync(t, s)
 	if n := f.count("PUT"); n != 1 {
-		t.Fatalf("first Put issued %d PUTs, want 1", n)
+		t.Fatalf("first Sync issued %d PUTs, want 1", n)
 	}
-	// A second store, so the in-memory "already uploaded" flag cannot help.
+	mustSync(t, s) // spool file is still there, bucket already has it
+	if n := f.count("PUT"); n != 1 {
+		t.Fatalf("second Sync issued %d PUTs total, want 1", n)
+	}
+
+	// A second store, so no in-memory state can be doing the work.
 	s2 := newStore(t, f, "", 1024, 1<<20)
-	h2, err := s2.Put(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if h1 != h2 {
-		t.Fatalf("hashes differ: %s vs %s", h1, h2)
+	spool(t, s2, hash, data)
+	if done := mustSync(t, s2); len(done) != 1 || done[0] != hash {
+		t.Fatalf("Sync confirmed %v, want [%s]", done, hash)
 	}
 	if n := f.count("PUT"); n != 1 {
-		t.Fatalf("re-Put issued %d PUTs total, want 1", n)
-	}
-}
-
-func TestAdoptDir(t *testing.T) {
-	f := newFakeS3(t)
-	s := newStore(t, f, "", 1024, 1<<20)
-
-	dir := t.TempDir()
-	want := map[string][]byte{}
-	for _, name := range []string{"a.bin", "b.bin", "sub/c.bin"} {
-		data := randBytes(2500, int64(len(name)))
-		p := filepath.Join(dir, name)
-		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(p, data, 0o644); err != nil {
-			t.Fatal(err)
-		}
-		want[filepath.ToSlash(name)] = data
+		t.Fatalf("re-Sync from a fresh store issued %d PUTs total, want 1", n)
 	}
 
-	got := map[string]string{}
-	err := s.AdoptDir(context.Background(), dir, time.Millisecond, true,
-		func(rel, hash string) error {
-			got[filepath.ToSlash(rel)] = hash
-			return nil
-		})
-	if err != nil {
+	// Release works off a HEAD alone, with no Sync in this process.
+	s3 := newStore(t, f, "", 1024, 1<<20)
+	spool(t, s3, hash, data)
+	if err := s3.Release(hash); err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != len(want) {
-		t.Fatalf("adopted %d files, want %d", len(got), len(want))
-	}
-	for rel, hash := range got {
-		if _, err := os.Stat(filepath.Join(dir, rel)); !errors.Is(err, fs.ErrNotExist) {
-			t.Fatalf("%s not released: %v", rel, err)
-		}
-		file, err := s.Open(hash)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if b := readAll(t, file); !bytes.Equal(b, want[rel]) {
-			t.Fatalf("%s bytes differ after adoption", rel)
-		}
-		file.Close()
+	if _, err := os.Stat(s3.SpoolPath(hash)); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("Release left the spool file behind: %v", err)
 	}
 }
