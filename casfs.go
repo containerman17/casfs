@@ -25,6 +25,7 @@ package casfs
 
 import (
 	"container/list"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -39,6 +40,10 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/credentials"
 )
 
 const (
@@ -54,11 +59,18 @@ const (
 
 type Config struct {
 	Endpoint  string // scheme://host[:port], path-style, no bucket
-	Region    string // default "auto" (works for R2; MinIO ignores it)
+	Region    string // default: the AWS default chain's region, else "auto" (R2; MinIO ignores it)
 	Bucket    string
 	Prefix    string // optional key prefix, used verbatim (include a trailing "/")
 	AccessKey string
 	SecretKey string
+
+	// Credentials, when set, resolves the keys for every request, so a
+	// provider that refreshes (SSO, instance role) keeps working. It is only
+	// consulted when AccessKey is empty: static keys win. With neither, casfs
+	// falls back to the AWS SDK's default chain (env, shared config, SSO,
+	// instance role), which also supplies Region when Region is empty.
+	Credentials aws.CredentialsProvider
 
 	SpoolDir   string // hash-named files awaiting upload, created if missing
 	CacheDir   string // one sparse file per artifact, created if missing
@@ -143,6 +155,19 @@ func New(cfg Config) (*Store, error) {
 	if cfg.TouchInterval == 0 {
 		cfg.TouchInterval = DefaultTouchInterval
 	}
+	switch {
+	case cfg.AccessKey != "":
+		cfg.Credentials = credentials.NewStaticCredentialsProvider(cfg.AccessKey, cfg.SecretKey, "")
+	case cfg.Credentials == nil:
+		awscfg, err := config.LoadDefaultConfig(context.Background())
+		if err != nil {
+			return nil, fmt.Errorf("casfs: no AccessKey and no default AWS credentials: %w", err)
+		}
+		cfg.Credentials = awscfg.Credentials
+		if cfg.Region == "" {
+			cfg.Region = awscfg.Region
+		}
+	}
 	if cfg.Region == "" {
 		cfg.Region = "auto"
 	}
@@ -160,8 +185,7 @@ func New(cfg Config) (*Store, error) {
 			endpoint: strings.TrimSuffix(cfg.Endpoint, "/"),
 			region:   cfg.Region,
 			bucket:   cfg.Bucket,
-			ak:       cfg.AccessKey,
-			sk:       cfg.SecretKey,
+			creds:    cfg.Credentials,
 			http:     cfg.HTTPClient,
 		},
 		sizes:     map[string]int64{},

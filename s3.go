@@ -13,6 +13,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
 )
 
 // emptySHA256 is the hex sha256 of the empty byte slice, used as the payload
@@ -26,7 +28,7 @@ type s3 struct {
 	endpoint string
 	region   string
 	bucket   string
-	ak, sk   string
+	creds    aws.CredentialsProvider
 	http     *http.Client
 }
 
@@ -55,18 +57,32 @@ func signingKey(secret, date, region, service string) []byte {
 	return hmacSHA(k, "aws4_request")
 }
 
-// sign adds the SigV4 headers. Only host, x-amz-content-sha256 and x-amz-date
-// are signed; Range is deliberately left unsigned, which S3 allows.
-func (c *s3) sign(req *http.Request, payloadHash string, now time.Time) {
+// sign adds the SigV4 headers. Only host, x-amz-content-sha256, x-amz-date and,
+// for temporary credentials, x-amz-security-token are signed; Range is
+// deliberately left unsigned, which S3 allows. Credentials are retrieved per
+// request, so a provider that refreshes (SSO, instance role) is picked up
+// without rebuilding the store.
+func (c *s3) sign(req *http.Request, payloadHash string, now time.Time) error {
+	cr, err := c.creds.Retrieve(req.Context())
+	if err != nil {
+		return fmt.Errorf("casfs: retrieve credentials: %w", err)
+	}
 	amzDate := now.UTC().Format("20060102T150405Z")
 	date := now.UTC().Format("20060102")
 	req.Header.Set("X-Amz-Content-Sha256", payloadHash)
 	req.Header.Set("X-Amz-Date", amzDate)
 
-	const signed = "host;x-amz-content-sha256;x-amz-date"
+	signed := "host;x-amz-content-sha256;x-amz-date"
 	canonHeaders := "host:" + req.URL.Host + "\n" +
 		"x-amz-content-sha256:" + payloadHash + "\n" +
 		"x-amz-date:" + amzDate + "\n"
+	if cr.SessionToken != "" {
+		// A session token is an ordinary signed header, and it sorts last of
+		// the four.
+		req.Header.Set("X-Amz-Security-Token", cr.SessionToken)
+		signed += ";x-amz-security-token"
+		canonHeaders += "x-amz-security-token:" + cr.SessionToken + "\n"
+	}
 	canonReq := strings.Join([]string{
 		req.Method,
 		req.URL.EscapedPath(),
@@ -79,10 +95,11 @@ func (c *s3) sign(req *http.Request, payloadHash string, now time.Time) {
 	scope := date + "/" + c.region + "/s3/aws4_request"
 	sum := sha256.Sum256([]byte(canonReq))
 	sts := "AWS4-HMAC-SHA256\n" + amzDate + "\n" + scope + "\n" + hex.EncodeToString(sum[:])
-	sig := hex.EncodeToString(hmacSHA(signingKey(c.sk, date, c.region, "s3"), sts))
+	sig := hex.EncodeToString(hmacSHA(signingKey(cr.SecretAccessKey, date, c.region, "s3"), sts))
 
-	req.Header.Set("Authorization", "AWS4-HMAC-SHA256 Credential="+c.ak+"/"+scope+
+	req.Header.Set("Authorization", "AWS4-HMAC-SHA256 Credential="+cr.AccessKeyID+"/"+scope+
 		", SignedHeaders="+signed+", Signature="+sig)
+	return nil
 }
 
 // httpErr turns a non-2xx response into an error, mapping 404 to fs.ErrNotExist
@@ -113,7 +130,9 @@ func (c *s3) head(key string) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	c.sign(req, emptySHA256, time.Now())
+	if err := c.sign(req, emptySHA256, time.Now()); err != nil {
+		return 0, err
+	}
 	resp, err := c.http.Do(req)
 	if err != nil {
 		return 0, fmt.Errorf("casfs: head %s: %w", key, err)
@@ -139,7 +158,9 @@ func (c *s3) get(key string, off, n int64) (io.ReadCloser, int64, error) {
 	if n > 0 {
 		req.Header.Set("Range", "bytes="+strconv.FormatInt(off, 10)+"-"+strconv.FormatInt(off+n-1, 10))
 	}
-	c.sign(req, emptySHA256, time.Now())
+	if err := c.sign(req, emptySHA256, time.Now()); err != nil {
+		return nil, 0, err
+	}
 	resp, err := c.http.Do(req)
 	if err != nil {
 		return nil, 0, fmt.Errorf("casfs: get %s: %w", key, err)
@@ -174,7 +195,9 @@ func (c *s3) put(key string, body io.Reader, size int64, payloadHash string) err
 		return err
 	}
 	req.ContentLength = size
-	c.sign(req, payloadHash, time.Now())
+	if err := c.sign(req, payloadHash, time.Now()); err != nil {
+		return err
+	}
 	resp, err := c.http.Do(req)
 	if err != nil {
 		return fmt.Errorf("casfs: put %s: %w", key, err)

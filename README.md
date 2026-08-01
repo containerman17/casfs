@@ -72,7 +72,7 @@ s, err := casfs.New(casfs.Config{
     Region:     "auto",
     Bucket:     "epochs",
     Prefix:     "v1/",     // optional, used verbatim
-    AccessKey:  "...",
+    AccessKey:  "...",     // static keys win; leave empty for the AWS default chain
     SecretKey:  "...",
     SpoolDir:   "/var/lib/app/spool",
     CacheDir:   "/var/lib/app/cache",
@@ -256,6 +256,16 @@ Consequences to know about:
 Hand-rolled SigV4 over `net/http`: casfs needs exactly HEAD, PUT, GET and
 ranged GET, which is about 60 lines of signing that both R2 and MinIO accept,
 versus minio-go's transitive dependency tree for the same four calls.
+
+The one AWS dependency is credential resolution, not S3: `aws-sdk-go-v2`'s
+`config`/`credentials` supply `Config.Credentials`, so SSO, instance roles and
+anything else the default chain knows about work, including their refresh.
+Static `AccessKey`/`SecretKey` take precedence and never touch the chain (the
+R2 and MinIO path). Credentials are retrieved per request; when they carry a
+session token it is signed as a fourth header, `x-amz-security-token`, and
+`TestSignMatchesAWSSigner` compares the whole Authorization header against the
+SDK's own signer with and without one. The default chain also supplies the
+region when `Region` is empty, before the `"auto"` fallback.
 
 ## Notes and deliberate omissions
 
