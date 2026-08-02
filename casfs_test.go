@@ -1152,9 +1152,16 @@ func TestPointersAreLocalFirst(t *testing.T) {
 	if v, err := s2.GetPointer("chunks/" + strings.Repeat("a", 63)); err != nil || v != "x" {
 		t.Fatalf("after reopen nested GetPointer = %q, %v", v, err)
 	}
-	// The values live under the spool and are not mistaken for content.
+	// Nothing can be uploaded, so nothing is released: the values sit in the
+	// spool and the node keeps working off them, forever.
 	if done, err := s2.Sync(); len(done) != 0 || err == nil {
 		t.Fatalf("Sync of pointers only: done=%v err=%v, want no content and a credentials error", done, err)
+	}
+	if _, err := os.Stat(s2.pointerPath("latest")); err != nil {
+		t.Fatalf("an unuploadable pointer left the spool: %v", err)
+	}
+	if v, err := s2.GetPointer("latest"); err != nil || v != "epoch def\n" {
+		t.Fatalf("after a failed reconcile GetPointer = %q, %v", v, err)
 	}
 }
 
@@ -1181,6 +1188,24 @@ func TestSyncUploadsContentBeforePointers(t *testing.T) {
 	f.mu.Unlock()
 	if len(puts) != 4 || puts[3] != "epoch/latest" {
 		t.Fatalf("PUT order %v, want the three artifacts then epoch/latest", puts)
+	}
+
+	// Confirmed in the bucket, so the local copy is released exactly like an
+	// artifact's, and the next read re-materializes it from the bucket.
+	if _, err := os.Stat(s.pointerPath("latest")); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("an uploaded pointer stayed in the spool: %v", err)
+	}
+	if v, err := s.GetPointer("latest"); err != nil || v != "epoch "+hashes[2] {
+		t.Fatalf("GetPointer after release = %q, %v", v, err)
+	}
+	if _, err := os.Stat(s.pointerPath("latest")); err != nil {
+		t.Fatalf("the bucket read did not re-materialize the pointer: %v", err)
+	}
+	// Re-materialized clean: a store must not re-upload a value it read.
+	before := f.count("PUT")
+	mustSync(t, s)
+	if n := f.count("PUT"); n != before {
+		t.Fatalf("re-materialized pointer was re-uploaded: %d PUTs, want %d", n, before)
 	}
 
 	// A pass that cannot upload some artifact publishes NO pointer: the

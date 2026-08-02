@@ -117,16 +117,24 @@ file, so one bad spool entry does not stall the rest.
 
 Pointers are the one mutable, non-content-addressed object. A pointer name that
 looks like a content hash is rejected, so the two key spaces cannot collide.
-They are LOCAL FIRST, both ways: `SetPointer` writes the value under the spool
-(`.pointers/<name>`) and returns, making no network call at all, and `Sync`
-carries it to the bucket AFTER that pass's content, so a bucket reader
-following a pointer never lands on an object that is not there yet. A pass
-whose content upload failed leaves its pointers local and retries next time.
-`GetPointer` answers from the local copy when there is one (the writer's own
-truth) and only falls through to the bucket for a name this store has never
-written, which is the fresh-consumer case; that bucket error comes back as it
-is. A store whose credentials have expired therefore keeps setting and reading
-its own pointers exactly as an offline one does, and only uploads stall.
+They have EXACTLY THE SPOOL SEMANTICS OF CONTENT. `SetPointer` writes the value
+under the spool (`.pointers/<name>`, tmp+rename) and returns, making no network
+call at all; `Sync` uploads it AFTER that pass's content, so a bucket reader
+following a pointer never lands on an object that is not there yet, and then
+deletes the local file, the same release an artifact gets. A pass whose content
+upload failed leaves its pointers spooled and retries next time.
+
+`GetPointer` answers from the spooled value while there is one. Once it has
+been uploaded and released, or on a store that never wrote it, the read goes to
+the bucket and the value is written back to the spool, so the next read and the
+next process are local again. That write-back is clean, never dirty: a store
+re-uploading a value it did not author could only put a stale pointer over a
+newer one. A bucket read that fails bubbles as it is, and a missing pointer
+wraps `fs.ErrNotExist`; nothing is ever invented.
+
+A store whose credentials have expired therefore keeps setting and reading its
+own pointers exactly as an offline one does. Only uploads stall, and the values
+simply stay in the spool until they can go.
 
 There is no manual `Evict`: eviction is driven by the byte cap alone. `Close`
 is not a shutdown handshake either, it is a flush plus the clean marker, and
