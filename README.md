@@ -117,6 +117,16 @@ file, so one bad spool entry does not stall the rest.
 
 Pointers are the one mutable, non-content-addressed object. A pointer name that
 looks like a content hash is rejected, so the two key spaces cannot collide.
+They are LOCAL FIRST, both ways: `SetPointer` writes the value under the spool
+(`.pointers/<name>`) and returns, making no network call at all, and `Sync`
+carries it to the bucket AFTER that pass's content, so a bucket reader
+following a pointer never lands on an object that is not there yet. A pass
+whose content upload failed leaves its pointers local and retries next time.
+`GetPointer` answers from the local copy when there is one (the writer's own
+truth) and only falls through to the bucket for a name this store has never
+written, which is the fresh-consumer case; that bucket error comes back as it
+is. A store whose credentials have expired therefore keeps setting and reading
+its own pointers exactly as an offline one does, and only uploads stall.
 
 There is no manual `Evict`: eviction is driven by the byte cap alone. `Close`
 is not a shutdown handshake either, it is a flush plus the clean marker, and

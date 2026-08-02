@@ -2,6 +2,7 @@ package casfs
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -15,6 +16,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
 )
 
 func newStore(t *testing.T, f *fakeS3, prefix string, chunkSize, cacheBytes int64) *Store {
@@ -1087,6 +1090,140 @@ func TestPointers(t *testing.T) {
 	}
 	if err := s.SetPointer(strings.Repeat("a", 64), "x"); err == nil {
 		t.Fatal("pointer name shaped like a hash was accepted")
+	}
+}
+
+// deadCreds is an expired SSO session: every request that needs a signature
+// fails before a socket is opened. A store built on it is the node whose token
+// went stale overnight.
+type deadCreds struct{}
+
+func (deadCreds) Retrieve(context.Context) (aws.Credentials, error) {
+	return aws.Credentials{}, errors.New("InvalidGrantException")
+}
+
+// deadStore has an unusable credential provider and an endpoint nothing is
+// listening on, so anything that reaches for the bucket is guaranteed to fail
+// loudly.
+func deadStore(t *testing.T) *Store {
+	t.Helper()
+	root := t.TempDir()
+	s, err := New(Config{
+		Endpoint:    "http://127.0.0.1:1",
+		Bucket:      "epochs",
+		Prefix:      "epoch/",
+		Credentials: deadCreds{},
+		SpoolDir:    filepath.Join(root, "spool"),
+		CacheDir:    filepath.Join(root, "cache"),
+		CacheBytes:  1 << 20,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return s
+}
+
+// TestPointersAreLocalFirst is the ruling of 2026-08-02: a producer whose
+// credentials are gone keeps setting and reading its own pointers, forever,
+// because neither call goes near the network. Only uploads stall.
+func TestPointersAreLocalFirst(t *testing.T) {
+	s := deadStore(t)
+	if err := s.SetPointer("latest", "epoch abc\n"); err != nil {
+		t.Fatalf("SetPointer with dead credentials: %v", err)
+	}
+	if v, err := s.GetPointer("latest"); err != nil || v != "epoch abc\n" {
+		t.Fatalf("GetPointer = %q, %v", v, err)
+	}
+	// Overwriting before any reconcile is fine: the newest value is the one
+	// on disk, and the only one that will ever be uploaded.
+	if err := s.SetPointer("latest", "epoch def\n"); err != nil {
+		t.Fatal(err)
+	}
+	// A nested name (epochdb publishes chunks/<hash>) is a nested file.
+	if err := s.SetPointer("chunks/"+strings.Repeat("a", 63), "x"); err != nil {
+		t.Fatal(err)
+	}
+
+	s2 := reopen(t, s)
+	defer s2.Close()
+	if v, err := s2.GetPointer("latest"); err != nil || v != "epoch def\n" {
+		t.Fatalf("after reopen GetPointer = %q, %v", v, err)
+	}
+	if v, err := s2.GetPointer("chunks/" + strings.Repeat("a", 63)); err != nil || v != "x" {
+		t.Fatalf("after reopen nested GetPointer = %q, %v", v, err)
+	}
+	// The values live under the spool and are not mistaken for content.
+	if done, err := s2.Sync(); len(done) != 0 || err == nil {
+		t.Fatalf("Sync of pointers only: done=%v err=%v, want no content and a credentials error", done, err)
+	}
+}
+
+// TestSyncUploadsContentBeforePointers pins the reconcile order. A pointer
+// names content, so it may only become visible in the bucket after that
+// content is there, and not at all while some artifact is still failing.
+func TestSyncUploadsContentBeforePointers(t *testing.T) {
+	f := newFakeS3(t)
+	s := newStore(t, f, "epoch/", 1024, 1<<20)
+
+	var hashes []string
+	for i := 0; i < 3; i++ {
+		data := randBytes(2000, int64(i))
+		hashes = append(hashes, hashOf(data))
+		spool(t, s, hashOf(data), data)
+	}
+	if err := s.SetPointer("latest", "epoch "+hashes[2]); err != nil {
+		t.Fatal(err)
+	}
+	mustSync(t, s)
+
+	f.mu.Lock()
+	puts := append([]string(nil), f.puts...)
+	f.mu.Unlock()
+	if len(puts) != 4 || puts[3] != "epoch/latest" {
+		t.Fatalf("PUT order %v, want the three artifacts then epoch/latest", puts)
+	}
+
+	// A pass that cannot upload some artifact publishes NO pointer: the
+	// pointer would name content the bucket does not have.
+	spool(t, s, hashOf([]byte("lies")), []byte("different bytes entirely"))
+	if err := s.SetPointer("latest", "epoch "+hashOf([]byte("lies"))); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Sync(); err == nil {
+		t.Fatal("Sync with a lying spool file reported success")
+	}
+	f.mu.Lock()
+	got := string(f.objects["epoch/latest"])
+	f.mu.Unlock()
+	if got != "epoch "+hashes[2] {
+		t.Fatalf("bucket pointer = %q after a failed pass, want the last cleanly synced value", got)
+	}
+}
+
+// TestGetPointerFallsBackToBucket is the fresh consumer: it has never written
+// this name, so the only copy is the bucket's, and a bucket that cannot be
+// read is an error, never a guess.
+func TestGetPointerFallsBackToBucket(t *testing.T) {
+	f := newFakeS3(t)
+	s := newStore(t, f, "epoch/", 1024, 1<<20)
+	f.mu.Lock()
+	f.objects["epoch/latest"] = []byte("epoch 1234\n")
+	f.mu.Unlock()
+
+	if v, err := s.GetPointer("latest"); err != nil || v != "epoch 1234\n" {
+		t.Fatalf("consumer GetPointer = %q, %v", v, err)
+	}
+	if _, err := s.GetPointer("nothing"); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("missing pointer err=%v, want fs.ErrNotExist", err)
+	}
+
+	// The same read on a store that cannot reach the bucket bubbles the real
+	// failure rather than inventing an answer.
+	dead := deadStore(t)
+	defer dead.Close()
+	_, err := dead.GetPointer("latest")
+	if err == nil || !strings.Contains(err.Error(), "InvalidGrantException") {
+		t.Fatalf("unreadable bucket pointer err=%v, want the credential failure", err)
 	}
 }
 

@@ -11,6 +11,12 @@
 // does not already have. The durable copy is the spool file or the bucket,
 // never the chunk cache, which is disposable by construction.
 //
+// WRITES NEVER TOUCH THE NETWORK. That holds for the one mutable name too:
+// SetPointer writes the value under the spool and returns, and Sync reconciles
+// it to the bucket after that pass's content. Reads are local first and only
+// go to the bucket for what is genuinely not here, where a failure is an
+// honest error rather than a guess.
+//
 // There is exactly one read path: the chunk cache. Each artifact is cached as
 // ONE SPARSE FILE of its full size, and a chunk is filled by pwriting it at its
 // true offset, from the spool file when it is still there or by a ranged GET
@@ -55,6 +61,10 @@ const (
 	// last process died without flushing, so the cache is wiped. See the crash
 	// safety section of the README.
 	cleanMarker = ".clean"
+	// pointerDir holds pointer values inside the spool directory. The leading
+	// dot is what keeps it out of the content-address space: a hash name is 64
+	// hex characters, so no artifact can ever be called this.
+	pointerDir = ".pointers"
 )
 
 type Config struct {
@@ -134,6 +144,9 @@ type Store struct {
 	lru       *list.List // front = most recently used, values are *chunk
 	idx       map[string]*list.Element
 	used      int64
+	// dirty is the pointer names whose local value the bucket may not have
+	// yet. Seeded from disk at New, added to by SetPointer, drained by Sync.
+	dirty map[string]bool
 }
 
 func New(cfg Config) (*Store, error) {
@@ -193,11 +206,15 @@ func New(cfg Config) (*Store, error) {
 		arts:      map[string]*artifact{},
 		lru:       list.New(),
 		idx:       map[string]*list.Element{},
+		dirty:     map[string]bool{},
 	}
 	if err := s.reclaim(); err != nil {
 		return nil, err
 	}
 	if err := s.scanCache(); err != nil {
+		return nil, err
+	}
+	if err := s.scanPointers(); err != nil {
 		return nil, err
 	}
 	return s, nil
@@ -370,9 +387,14 @@ func (s *Store) Put(path string) (string, error) {
 // then returns the hashes now confirmed present in the bucket. Failures are
 // collected per file, so one bad entry does not stall the rest.
 //
+// CONTENT FIRST, POINTERS LAST, and only when the content went up cleanly: a
+// pointer names content, so publishing it before its content would hand a
+// bucket reader a dangling name. A pass that could not upload some artifact
+// leaves every dirty pointer local and tries again next time.
+//
 // Call it after Put, on a ticker, at startup, whenever. It is the only thing
 // that moves bytes out, and it is driven purely by what the spool directory
-// contains.
+// and the local pointers contain.
 func (s *Store) Sync() ([]string, error) {
 	ents, err := os.ReadDir(s.cfg.SpoolDir)
 	if err != nil {
@@ -393,6 +415,9 @@ func (s *Store) Sync() ([]string, error) {
 		s.confirmed[hash] = true
 		s.mu.Unlock()
 		done = append(done, hash)
+	}
+	if len(errs) == 0 {
+		errs = append(errs, s.syncPointers())
 	}
 	return done, errors.Join(errs...)
 }
@@ -730,24 +755,127 @@ func (s *Store) CacheUsage() int64 {
 	return s.used
 }
 
-// SetPointer writes a small mutable object at Prefix+name. Pointer names may
-// not look like a content hash, so they can never collide with stored content.
+// SetPointer writes a small mutable value at name. It is LOCAL AND SYNCHRONOUS
+// AND NOTHING ELSE: the value lands durably under the spool by tmp+rename and
+// the call returns without a single network byte. Sync carries it to
+// Prefix+name in the bucket later, after the content of that same pass. A
+// pointer overwritten several times before a Sync uploads only its newest
+// value.
+//
+// Pointer names may not look like a content hash, so they can never collide
+// with stored content.
 func (s *Store) SetPointer(name, value string) error {
 	if err := checkPointer(name); err != nil {
 		return err
 	}
-	sum := sha256.Sum256([]byte(value))
-	return s.s3.put(s.cfg.Prefix+name, strings.NewReader(value), int64(len(value)), hex.EncodeToString(sum[:]))
+	p := s.pointerPath(name)
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		return err
+	}
+	if err := os.WriteFile(p+".tmp", []byte(value), 0o644); err != nil {
+		return err
+	}
+	if err := os.Rename(p+".tmp", p); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	s.dirty[name] = true
+	s.mu.Unlock()
+	return nil
 }
 
-// GetPointer reads a pointer. A missing pointer returns an error wrapping
+// GetPointer reads a pointer, LOCAL FIRST: a writer's own copy is by
+// construction at least as fresh as the bucket's, and reading it costs nothing
+// and cannot fail on credentials. Only a name this store has never written
+// falls through to the bucket, which is the fresh-consumer case, and that
+// error is returned as it comes. A missing pointer returns an error wrapping
 // fs.ErrNotExist.
 func (s *Store) GetPointer(name string) (string, error) {
 	if err := checkPointer(name); err != nil {
 		return "", err
 	}
-	b, err := s.s3.getAll(s.cfg.Prefix + name)
-	return string(b), err
+	b, err := os.ReadFile(s.pointerPath(name))
+	if err == nil {
+		return string(b), nil
+	}
+	if !errors.Is(err, fs.ErrNotExist) {
+		return "", err
+	}
+	v, err := s.s3.getAll(s.cfg.Prefix + name)
+	return string(v), err
+}
+
+// pointerPath is where name's value lives locally: under the spool, in a
+// directory whose leading dot keeps it out of the content-address space (Sync
+// only ever looks at hash-named entries) and out of the chunk cache, which is
+// wiped on an unclean start.
+func (s *Store) pointerPath(name string) string {
+	return filepath.Join(s.cfg.SpoolDir, pointerDir, filepath.FromSlash(name))
+}
+
+// scanPointers marks every pointer already on disk dirty, so a process that
+// died between a SetPointer and a Sync still gets that value to the bucket.
+//
+// ponytail: one re-upload per pointer per process start, because "dirty" is
+// in memory. A pointer count where that PUT storm matters wants the uploaded
+// value kept in a sidecar and compared instead.
+func (s *Store) scanPointers() error {
+	root := filepath.Join(s.cfg.SpoolDir, pointerDir)
+	return filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			if errors.Is(err, fs.ErrNotExist) {
+				return nil // no pointer has ever been written here
+			}
+			return err
+		}
+		if d.IsDir() || strings.HasSuffix(p, ".tmp") {
+			return nil
+		}
+		rel, err := filepath.Rel(root, p)
+		if err != nil {
+			return err
+		}
+		s.dirty[filepath.ToSlash(rel)] = true
+		return nil
+	})
+}
+
+// syncPointers uploads every locally dirty pointer. Sync calls it LAST and
+// only when the content of the same pass went up cleanly, which is the whole
+// ordering guarantee: a pointer is visible in the bucket only once the
+// content it names is, so a consumer following one never lands on a missing
+// object.
+func (s *Store) syncPointers() error {
+	s.mu.Lock()
+	names := make([]string, 0, len(s.dirty))
+	for n := range s.dirty {
+		names = append(names, n)
+	}
+	s.mu.Unlock()
+
+	var errs []error
+	for _, name := range names {
+		p := s.pointerPath(name)
+		v, err := os.ReadFile(p)
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		sum := sha256.Sum256(v)
+		if err := s.s3.put(s.cfg.Prefix+name, strings.NewReader(string(v)), int64(len(v)), hex.EncodeToString(sum[:])); err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		// Clear only if the value on disk is still the one just uploaded: a
+		// SetPointer racing this pass leaves the pointer dirty for the next
+		// one rather than losing the newer value.
+		if cur, err := os.ReadFile(p); err == nil && string(cur) == string(v) {
+			s.mu.Lock()
+			delete(s.dirty, name)
+			s.mu.Unlock()
+		}
+	}
+	return errors.Join(errs...)
 }
 
 func checkPointer(name string) error {

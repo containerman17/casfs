@@ -23,6 +23,7 @@ type fakeS3 struct {
 	mu      sync.Mutex
 	objects map[string][]byte
 	counts  map[string]int // method -> request count
+	puts    []string       // keys stored, in the order they were stored
 }
 
 func newFakeS3(t *testing.T) *fakeS3 {
@@ -78,6 +79,7 @@ func (f *fakeS3) serve(w http.ResponseWriter, r *http.Request) {
 		}
 		f.mu.Lock()
 		f.objects[key] = body
+		f.puts = append(f.puts, key)
 		f.mu.Unlock()
 		w.WriteHeader(http.StatusOK)
 
