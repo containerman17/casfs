@@ -599,6 +599,10 @@ type File struct {
 
 func (f *File) Size() int64 { return f.size }
 
+// Close releases the spool mapping and descriptor. CLOSE EVERY VIEW FIRST: a
+// view of a spool-resident artifact is a window onto the mapping this owns, so
+// touching one afterwards is a segfault rather than an error return. A view
+// over the chunk cache owns its own mappings and does not care.
 func (f *File) Close() error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -633,11 +637,7 @@ func (f *File) ReadAt(p []byte, off int64) (int, error) {
 		return 0, io.EOF
 	}
 	if f.spool != nil {
-		n, err := f.spool.ReadAt(p, off)
-		if err == nil || errors.Is(err, io.EOF) {
-			return n, err
-		}
-		return n, err
+		return f.spool.ReadAt(p, off)
 	}
 	cs := f.s.cfg.ChunkSize
 	n := 0
