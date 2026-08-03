@@ -1,20 +1,19 @@
 # casfs
 
 A content-addressed file store on top of any S3-compatible bucket, with lazy
-chunked reads and a byte-capped local disk cache.
+chunked reads and a shared local disk cache.
 
 Whole files live in the bucket under their hex sha256, which is the entire
 object key (optionally behind a configured prefix). Uploads are therefore
 idempotent, and two writers racing on the same content write identical bytes,
 so there is nothing to coordinate.
 
-Locally, an object is cached as **one sparse file of its full size**, so a
-consumer can mmap the whole thing and let the kernel tier RAM to SSD while
-casfs tiers SSD to S3.
+Locally, an object is cached as **plain 4MB chunk files in a shared directory
+of time windows**. Reads are `open`+`pread`; a consumer that genuinely needs a
+range for the life of its process can map it, one mapping per chunk.
 
-Zero dependencies outside the standard library. Linux only: presence is
-SEEK_DATA and eviction is FALLOC_FL_PUNCH_HOLE, and neither has a portable
-analogue worth faking, so there is no fallback.
+Zero dependencies outside the standard library, apart from AWS credential
+resolution. Linux only: the cache uses `statfs` and `mmap` with no fallback.
 
 ## The spool: durability is the filesystem
 
@@ -35,8 +34,8 @@ verification pass over a multi-gigabyte file.
 bucket is confirmed to hold the content. So a hash is never unreadable: the
 durable copy is the spool file, then the bucket, and the two overlap.
 
-The cache never counts as durability. It is disposable by construction, and
-the crash-safety section below leans on that hard.
+The cache never counts as durability. It is disposable by construction, which
+is what lets everything below be as blunt as it is.
 
 ## One read path
 
@@ -48,40 +47,38 @@ difference between local and remote content:
 - the spool file is still there, so `pread` the aligned range out of it
 - it is not, so issue an aligned ranged GET
 
-Either way the bytes are `pwrite`n into the object's sparse cache file **at
-their true offset**, counted against `CacheBytes`, and evicted like any other
-chunk. Two consequences worth having:
+Concurrent misses on one chunk collapse into a single upstream read. The bytes
+are handed back to every waiter and, if the disk has room, written to the
+current window as `<hash>.<index>` by tmp + fsync + rename.
 
-- **The upload transition is invisible.** Ranges that real traffic touched
-  while the file was spool-resident are already sitting in the chunk cache, so
-  when the upload ACKs and `Release` unlinks the spool file, the hot path does
-  not notice.
-- **Eviction accounting is uniform.** One LRU, one cap, one kind of file. No
-  special case for "the local one".
-
-`Release` stays dumb on purpose: it does not pre-warm the cache with the whole
-file. Ranges nobody ever read while the file was local are cold by definition,
-and copying gigabytes of them in would evict genuinely hot chunks of other
-files to do it. Those ranges fall to ranged GETs on demand, which is the point.
+**The upload transition is invisible.** Ranges that real traffic touched while
+the file was spool-resident keep being served from the spool descriptor the
+`File` holds, so when the upload ACKs and `Release` unlinks the spool file, the
+hot path does not notice. `Release` stays dumb on purpose: it does not pre-warm
+the cache. Ranges nobody ever read while the file was local are cold by
+definition, and copying gigabytes of them in would only push out chunks
+somebody else is using.
 
 ## API
 
 ```go
 s, err := casfs.New(casfs.Config{
-    Endpoint:   "https://<account>.r2.cloudflarestorage.com", // or http://127.0.0.1:9000
-    Region:     "auto",
-    Bucket:     "epochs",
-    Prefix:     "v1/",     // optional, used verbatim
-    AccessKey:  "...",     // static keys win; leave empty for the AWS default chain
-    SecretKey:  "...",
-    SpoolDir:   "/var/lib/app/spool",
-    CacheDir:   "/var/lib/app/cache",
-    CacheBytes: 8 << 30,
-    ChunkSize:  4 << 20,   // default
+    Endpoint:  "https://<account>.r2.cloudflarestorage.com", // or http://127.0.0.1:9000
+    Region:    "auto",
+    Bucket:    "epochs",
+    Prefix:    "v1/",     // optional, used verbatim
+    AccessKey: "...",     // static keys win; leave empty for the AWS default chain
+    SecretKey: "...",
+    SpoolDir:  "/var/lib/app/spool",
+    CacheDir:  "/var/lib/app/cache",
+    ChunkSize: 4 << 20,   // default
 
-    // How often a cache hit may refresh an object's mtime, which is what the
-    // startup LRU seed reads. 0 means 1 hour, negative disables it.
-    TouchInterval: time.Hour,
+    // Admission watermark, in absolute bytes of free space. 0 means 5% of the
+    // filesystem, i.e. cache up to 95% full.
+    CacheMinFree: 20 << 30,
+    // Whole windows older than this are deleted by name, whatever the disk
+    // looks like. 0 means 30 days.
+    CacheMaxAge: 30 * 24 * time.Hour,
 })
 
 path := s.SpoolPath(hash)       // rename your finished file onto this, yourself
@@ -91,18 +88,18 @@ done, err := s.Sync()           // upload everything spooled and not yet in the 
 err = s.Release(hash)           // unlink the spool file, refuses until uploaded
 
 f, err := s.Open(hash)          // *File: io.ReaderAt, io.Closer, Size() int64
-n, err := f.ReadAt(p, off)      // copies, always correct, never needs a pin
+n, err := f.ReadAt(p, off)      // the query path: pread and copy
 
-err = f.Pin(off, n)             // this range may not be hole-punched
-b, err := f.View(off, n)        // zero-copy window onto an mmap of the object
-err = f.Unpin(off, n)           // ...and now it may be
+v, err := f.View(off, n)        // long-lived: one mapping per chunk
+b := v.Slice(off, n)            // aliases inside a chunk, copies across one
+err = v.Close()                 // unmaps
 
-err = s.Close()                 // flush, mark the cache clean, drop the fds
+err = s.Close()                 // stops the eviction worker, nothing else
 
 err = s.SetPointer("latest", hash)
-v, err := s.GetPointer("latest") // fs.ErrNotExist if absent
+val, err := s.GetPointer("latest") // fs.ErrNotExist if absent
 
-s.CacheUsage()                   // chunk bytes on disk, spool files excluded
+st := s.Stats()                  // evictions, admission refusals, victim age, free bytes
 ```
 
 `Put` is a convenience: it hashes the file and renames it into the spool, and
@@ -136,42 +133,124 @@ A store whose credentials have expired therefore keeps setting and reading its
 own pointers exactly as an offline one does. Only uploads stall, and the values
 simply stay in the spool until they can go.
 
-There is no manual `Evict`: eviction is driven by the byte cap alone. `Close`
-is not a shutdown handshake either, it is a flush plus the clean marker, and
-skipping it costs the cache and nothing else. The store owns no goroutines.
+`Close` stops the eviction worker and does nothing else. There is no flush, no
+marker, and no shutdown handshake: skipping it costs nothing at all.
 
-## Views and the pinning contract
+## Layout
 
-`View` returns a subslice of a whole-object `PROT_READ` `MAP_SHARED` mapping of
-the cache file, after filling whatever chunks the range needs. Nothing is
-copied and nothing lands on the Go heap: a consumer can map a 4GB artifact,
-walk an index inside it, and let the kernel decide what stays in RAM.
+```
+<SpoolDir>/<hash>                       durable until uploaded
+<SpoolDir>/.pointers/<name>             durable until uploaded
+<CacheDir>/<window>/<hash>.<index>      disposable, 4MB, one file per chunk
+<CacheDir>/<window>/<hash>.<index>.*.tmp   a fill in flight
+```
 
-That mapping is coherent with the fills, on Linux, because `pwrite` and `mmap`
-go through the same page cache. A chunk filled after the mapping was created is
-visible through it immediately, with no remap and no barrier.
+A chunk file is named by **the artifact hash and the chunk index, not by a
+content hash of the chunk**. That name already identifies immutable bytes
+uniquely, a reader can derive it without anyone's chunk list, and any process
+looking at the file can decide who it belongs to. A content-hashed name would
+buy deduplication nobody has ever needed here and cost the ability to find a
+chunk you have not already been told the hash of.
 
-**A hole punch under a live mapping is silent.** The pages go away, the
-mapping stays, and the range reads back as zeros: no error, no fault, no short
-read. Whether that is harmless or catastrophic depends entirely on what the
-consumer thinks those bytes mean. For a bloom filter it is catastrophic, since
-zeroed bits turn "maybe present" into "definitely absent", which is a wrong
-answer rather than a slow one.
+A window is `unix_minutes / 20` as an integer, in UTC, never local time. The
+window a file sits in **is** its recency, so the LRU lives in the directory
+tree rather than in anyone's memory and survives a restart with no journal.
 
-So: **`Pin(off, n)` before reading a `View`, `Unpin(off, n)` after.** Eviction
-skips every chunk a pinned range touches, and will blow through `CacheBytes`
-rather than punch one. Pins are counted, live in memory only, and die with the
-process, which is correct, because so does every mapping they protect.
+`New` does one **name-only walk** of the window tree to build this process's
+`chunk -> window` map (175k files in ~110ms warm on ext4). Anything at the top
+level that is not a numeric window directory is deleted, which is the entire
+migration story off the old sparse per-artifact cache. There is no
+compatibility mode: the cache is disposable, so a layout change is paid for by
+refetching.
 
-`ReadAt` needs no pins. It copies, and it holds an internal pin for the
-duration of the copy, so it cannot be punched mid-read.
+That map is a **hint owned by one process**. An entry that is wrong because a
+sibling process evicted the file costs one `ENOENT` and a refetch, never a
+wrong answer, so no two processes have to agree about anything and several may
+share one cache directory.
 
-A `View` of a spool-resident object maps the spool file directly instead, so it
-never doubles the bytes on disk. `Release` unlinking that file afterwards does
-not disturb the mapping, because unlinking never does.
+## Recency: promote on touch
 
-`File.Close` unmaps, which invalidates every `View` that `File` handed out.
-Touching one afterwards is a segfault, not an error return.
+Reading a chunk that is in **any** window older than the current one renames it
+into the current one. That is at most one rename per chunk per window, and it
+is deliberately greedy: promoting only when a chunk is two or more windows
+behind stops distinguishing hot from cold exactly when it matters, because
+under pressure everything the worker is about to eat looks equally stale, and
+the cache degrades to FIFO.
+
+The file is opened before the rename, so a promotion that loses a race to
+another process costs a map entry and never the read in flight.
+
+## Admission control, not eviction, on the write path
+
+Before a fill is written, `statfs` says how many bytes are available. Over the
+watermark, **the chunk is not cached**: the fetched bytes are served from
+memory and forgotten. Nothing is ever deleted to make room for a fill.
+
+The fill itself is tmp + **fsync** + rename. The fsync is not tuning. Power
+loss between the write and the rename must never leave a torn chunk under a
+correct name: nothing reads chunk files back with a checksum, so torn bytes
+under the right name are a silent wrong answer, and a half-written bloom page
+answers "definitely absent" for keys that are there. A tmp name never becomes a
+chunk name, so a torn write is only ever garbage to collect.
+
+The watermark is absolute bytes, not a percentage, because casfs does not own
+the filesystem: what matters to everything else on the box is how much room is
+left, not what share of it casfs took. The default is 5% of the filesystem free,
+i.e. cache up to 95% full.
+
+## Eviction: one background worker
+
+One goroutine per store. While the disk is over the watermark it unlinks **one
+file at a time from the oldest non-current window**, in readdir order, with a
+small sleep between deletes; otherwise it idles on a long poll. The victim
+window's directory handle is cached across deletes, so a delete costs one
+`unlink` and not a readdir of a window holding a hundred thousand files. One
+delete per tick is the throttle; there is no other one.
+
+**It never touches the current window.** If only the current window has files,
+the worker stops and admission control carries the load: a saturated cache
+freezes full rather than eating the fills it just made. Churning is strictly
+worse than freezing, because every evicted-and-refetched chunk is a GET that
+bought nothing.
+
+A delete that returns `ENOENT` counts as progress: a sibling process got there
+first. A window the worker drains is `rmdir`ed. Unlinking while `getdents`
+walks the same directory may skip entries, so a window that refuses to `rmdir`
+is simply revisited on the next pass.
+
+Separately, and regardless of disk fill, whole window directories older than
+`CacheMaxAge` (default 30 days) are deleted **by name**, with no stat and no
+per-file work. That is safe precisely because a promotion's target is always
+the current window: nothing anyone still reads can be sitting in a directory
+named thirty days ago. Stray `*.tmp` files older than an hour are collected in
+the same pass.
+
+`Stats()` reports evictions, admission refusals, and **the age of the window
+the worker last deleted from**. That last number is the honest cache horizon:
+how long a chunk actually survives here. A byte budget could only ever have
+reported its own configuration back.
+
+## Views: the one place mappings are allowed
+
+`ReadAt` is the query path and it copies. Use it for everything transient.
+
+`View(off, n)` is for ranges a consumer reads for the life of its process:
+indexes, dictionaries, filters. It maps one chunk file per chunk the range
+covers. `Slice` is zero-copy inside a chunk and **copies across a chunk
+boundary**, which is the whole price of chunk files not being contiguous: at
+4MB granularity a 69-byte index entry straddles one boundary in about 60000, so
+the copy is noise and the common case allocates nothing.
+
+Because a mapping keeps its inode alive, a chunk that is unlinked while mapped
+keeps its blocks until the last `Close`. The ghost disk a consumer can hold is
+therefore bounded by the size of its resident set, and that is the accepted
+cost of not having a pin protocol. In exchange there is no way for eviction to
+turn live bytes into zeros, which is what the old hole-punch cache had to be
+defended against with pins.
+
+A `View` of a spool-resident object maps the spool file directly, so it never
+doubles the bytes on disk. A chunk the disk refused to cache is held as heap
+bytes instead, so a view is always complete whatever the disk is doing.
 
 ## The drop folder
 
@@ -179,95 +258,6 @@ There is no `AdoptDir`, because the spool directory already is one. Point your
 writer at `SpoolDir`, name files after their hash, call `Sync` on a ticker, and
 files trickle to S3 at whatever pace you tick. That is the whole feature and it
 needs no library code.
-
-## Layout
-
-```
-<SpoolDir>/<hash>                              durable
-<CacheDir>/<first 2 hex of hash>/<hash>        disposable, sparse, full size
-<CacheDir>/.clean                              written by Close, removed by New
-```
-
-One file per object, created at the object's full length and otherwise empty.
-A fill `pwrite`s a chunk at its true offset; everything never fetched, and
-everything evicted, is a hole that costs no blocks.
-
-**The kernel's extent map is the index.** `New` walks each file with
-`SEEK_DATA`/`SEEK_HOLE` and rebuilds an in-memory bitmap of which chunks are
-present. A chunk counts as present only if its whole range is reported as data,
-because the kernel is allowed to report data where there is really a hole but
-never the reverse, so the worst that conservatism costs is a refill. There is
-still no on-disk index, no manifest, and no compaction. The filesystem is the
-database, and now it is also the presence bitmap.
-
-Anything in the cache directory that is not a hash-named file in its own
-two-hex directory is deleted on startup, which is also the entire migration
-story off the old one-file-per-chunk layout. There is no compatibility mode:
-the cache is disposable, so a layout change is paid for by refetching.
-
-## Eviction
-
-An in-memory LRU keyed by (hash, chunk index), capped by `CacheBytes`. Evicting
-means `fallocate(FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE)` over that chunk's
-range: the blocks go back to the filesystem, the file keeps its length, and the
-range reads as zeros from then on. Pinned chunks are skipped, so a pin outranks
-the cap. Spool files are outside the cache entirely: they are never evicted,
-and only `Release` removes one.
-
-Because eviction can now cut a hole in a file someone is reading, both read
-paths take an internal pin for the duration of a fill and of a copy. That is
-also why a duplicate fill of the same chunk stays correct with no singleflight:
-both writers pwrite identical bytes to the same offsets, and both hold the
-range against eviction while they do it.
-
-### Throttled touch on read
-
-The in-memory LRU is the live authority. But it dies with the process, and the
-restart seed comes from mtime, so an object fetched three days ago and read
-every second since would look ancient to a fresh process and be evicted first,
-exactly backwards. So a cache hit also refreshes the file's mtime, throttled to
-at most one `utimes` per object per `TouchInterval` (default 1 hour, negative
-disables it). The last written mtime is kept in memory, so the throttle check
-costs no stat and the common hit does no extra syscall at all.
-
-There is one file per object now, so **the restart seed is per object, not per
-chunk**: all of one object's chunks are reseeded with one timestamp, in index
-order. That is a real loss of resolution and it is accepted, because the live
-LRU is per chunk and takes over within seconds of a restart, while the seed
-only has to get the coarse ordering between objects right.
-
-The cost ceiling is one `utimes` per object per interval, which is now trivial:
-a 50GB hot set of 4GB artifacts is 13 files.
-
-## Crash safety: the cache is wiped, not journalled
-
-The old layout got atomicity from `rename`. A sparse file has none: a fill is
-one `pwrite`, and a process that dies with dirty pages can leave an extent that
-`SEEK_DATA` calls present and that reads back half zeros. Nothing on disk can
-tell that apart from a complete chunk.
-
-Two sound answers exist. A per-object sidecar bitmap, written after the data
-with an fsync between them, so presence is `SEEK_DATA` intersected with
-committed bits. Or a clean-shutdown marker: `Close` fsyncs every cached file
-and then writes `<CacheDir>/.clean`, `New` removes it, and a `New` that does
-not find it wipes the cache.
-
-**casfs takes the marker.** The sidecar taxes every fill with two fsyncs,
-forever, to protect a cache whose entire contents can be refetched with one
-ranged GET each. The marker costs one fsync per object at shutdown and nothing
-at all in steady state, and its failure mode is a cold cache after a crash,
-which is the same thing as a cold start. Trading a rare bounded cost for a
-constant one is the wrong direction, so it is not built.
-
-Consequences to know about:
-
-- **A process that never calls `Close` starts cold every time.** That is the
-  contract, not a bug.
-- One process at a time per cache directory. `New` removing the marker means a
-  second `New` over a live cache directory would wipe it out from under the
-  first. The in-memory LRU already assumed single ownership.
-- A `kill -9` costs the cache, never correctness, and never anything durable:
-  the spool and the bucket are untouched.
 
 ## Dependency choice
 
@@ -287,23 +277,19 @@ region when `Region` is empty, before the `"auto"` fallback.
 
 ## Notes and deliberate omissions
 
-- `Open` on a hash that is neither spooled nor known to this process issues one
-  HEAD to learn the size, then memoizes it. There is still no on-disk index:
-  the cache file *is* the object's full length, so a clean restart learns the
-  size of everything it has cached for free. The in-memory size and
-  upload-confirmation maps are caches only; losing one costs one HEAD.
-- While a file is spool-resident, ranges that `ReadAt` touches exist twice on
-  disk, once in the spool file and once in the cache file. That is the price of
-  the single read path, and it resolves itself at `Release`. `View` does not
-  pay it: it maps the spool file directly.
-- One open descriptor per object touched since startup, never per chunk. That
-  is bounded by the number of distinct objects, which is what this store is
-  for; a workload that opens thousands would want an fd LRU that does not exist
-  yet.
-- Not implemented: multipart upload, DELETE, LIST, retries and backoff,
-  virtual-host-style addressing, and singleflight over concurrent fills of the
-  same chunk (a duplicate fill is correct, just wasteful, and the LRU does not
-  double-count it).
+- Object sizes are not persisted. `Open` on a hash that is neither spooled nor
+  known to this process issues one HEAD and memoizes it, so a restart pays one
+  HEAD per artifact it opens and nothing else. The old sparse layout learned
+  sizes from the cache file's length; plain chunk files do not carry that, and
+  one HEAD per artifact is cheaper than an index that could go stale.
+- The query path opens the chunk file on every `ReadAt`. That is `open`,
+  `pread`, `close`: three syscalls, no descriptor table to bound, and no cache
+  to invalidate when a sibling process deletes the file underneath.
+- Over the watermark every read refetches, because nothing is allowed to land.
+  That is a real degraded mode and it is counted (`Stats().Refusals`) rather
+  than hidden.
+- Not implemented: multipart upload, DELETE, LIST, retries and backoff, and
+  virtual-host-style addressing.
 
 ## Testing
 
@@ -313,14 +299,17 @@ well-formed SigV4 Authorization header and that PUT bodies match the signed
 payload hash; the signing key derivation is pinned to the published AWS test
 vector. Signature acceptance by a real service is not covered offline.
 
-The sparse layout is tested against the filesystem rather than against itself:
-eviction is asserted in `st_blocks` (8 chunks of 64KB read under a 256KB cap
-leave a 512KB file holding exactly 256KB of blocks), presence recovery is
-asserted by restarting over an interleaved set of filled chunks and reading
-them back with the S3 endpoint shut down, `View` is asserted to alias rather
-than copy, a pinned range is asserted to survive eviction pressure that punches
-everything around it, and the same range is then unpinned and asserted to read
-back as zeros, so the hazard the pin exists for is a test rather than a claim.
+The cache is tested against the filesystem rather than against itself. The
+worker is asserted to drain the oldest window first, whole, and then to stop
+dead when only the current window is left. Admission refusal is driven by a
+fake `statfs`, and a view over a disk that refuses everything is asserted to
+still return the right bytes. A chunk planted a day back in the window tree is
+asserted to be renamed forward by the read that touches it. A truncated tmp is
+asserted never to become a named chunk, and the read that follows it is
+asserted to come back correct. Thirty-two goroutines racing on one cold chunk
+are asserted to cost exactly one GET, and eight readers running against a
+goroutine deleting the entire cache in a loop are asserted to return
+byte-correct answers throughout.
 
 That signed payload hash is also the real defence against a lying spool file
 name: a compliant endpoint rejects the mismatched bytes before storing them.

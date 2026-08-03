@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"io/fs"
 	"math/rand"
@@ -13,36 +14,54 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"syscall"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 )
 
-func newStore(t *testing.T, f *fakeS3, prefix string, chunkSize, cacheBytes int64) *Store {
+// newStore builds a store over a fresh temp tree. CacheMinFree is pinned to
+// one byte so a test never depends on how full the developer's disk is; the
+// tests that care about the watermark install their own statfs.
+func newStore(t *testing.T, f *fakeS3, prefix string, chunkSize int64, opts ...func(*Config)) *Store {
 	t.Helper()
 	root := t.TempDir()
-	s, err := New(Config{
-		Endpoint:   f.URL,
-		Bucket:     f.bucket,
-		Prefix:     prefix,
-		AccessKey:  "minioadmin",
-		SecretKey:  "minioadmin",
-		SpoolDir:   filepath.Join(root, "spool"),
-		CacheDir:   filepath.Join(root, "cache"),
-		CacheBytes: cacheBytes,
-		ChunkSize:  chunkSize,
-	})
+	cfg := Config{
+		Endpoint:     f.URL,
+		Bucket:       f.bucket,
+		Prefix:       prefix,
+		AccessKey:    "minioadmin",
+		SecretKey:    "minioadmin",
+		SpoolDir:     filepath.Join(root, "spool"),
+		CacheDir:     filepath.Join(root, "cache"),
+		ChunkSize:    chunkSize,
+		CacheMinFree: 1,
+	}
+	for _, o := range opts {
+		o(&cfg)
+	}
+	s, err := New(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { s.Close() })
 	return s
 }
 
-// reopen closes a Store and builds a second one over the same spool and cache
-// directories, standing in for a clean restart. Without the Close the next New
-// finds no clean marker and wipes the cache, which is what crash returns.
+// fakeDisk installs a statfs a test can move, so the store can be put over its
+// watermark without filling anything.
+func fakeDisk(free *atomic.Int64, minFree int64) func(*Config) {
+	return func(c *Config) {
+		c.CacheMinFree = minFree
+		c.free = func(string) (int64, error) { return free.Load(), nil }
+	}
+}
+
+// reopen stops a Store's worker and builds a second one over the same spool
+// and cache directories, standing in for a restart. The cache is a tree of
+// finished files, so a restart trusts whatever is there: there is no marker
+// and nothing to wipe.
 func reopen(t *testing.T, s *Store) *Store {
 	t.Helper()
 	if err := s.Close(); err != nil {
@@ -52,32 +71,17 @@ func reopen(t *testing.T, s *Store) *Store {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { s2.Close() })
 	return s2
 }
 
-// blocks reports the 512-byte blocks a file actually occupies, which is the
-// only thing that answers whether a hole punch freed anything: the sparse
-// file's length never changes.
-func blocks(t *testing.T, path string) int64 {
+// stopped halts the eviction worker so a test can drive evictOne and sweep by
+// hand. Everything else on the Store keeps working.
+func stopped(t *testing.T, s *Store) {
 	t.Helper()
-	fi, err := os.Stat(path)
-	if err != nil {
+	if err := s.Close(); err != nil {
 		t.Fatal(err)
 	}
-	return fi.Sys().(*syscall.Stat_t).Blocks
-}
-
-func cacheBlocks(t *testing.T, s *Store) int64 {
-	t.Helper()
-	var total int64
-	filepath.WalkDir(s.cfg.CacheDir, func(p string, d fs.DirEntry, err error) error {
-		if err != nil || d.IsDir() {
-			return nil
-		}
-		total += blocks(t, p)
-		return nil
-	})
-	return total
 }
 
 func randBytes(n int, seed int64) []byte {
@@ -148,27 +152,32 @@ func mustSync(t *testing.T, s *Store) []string {
 	return done
 }
 
-// wipeCache clears the cache and returns a restarted store, which is what full
-// eviction of a hash's chunks looks like from the read path.
-func wipeCache(t *testing.T, s *Store) *Store {
+// cachedNames is every file in the window tree, mapped to the window it sits in.
+func cachedNames(t *testing.T, s *Store) map[string]int64 {
 	t.Helper()
-	if err := s.Close(); err != nil {
-		t.Fatal(err)
-	}
-	ents, err := os.ReadDir(s.cfg.CacheDir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, e := range ents {
-		if err := os.RemoveAll(filepath.Join(s.cfg.CacheDir, e.Name())); err != nil {
+	out := map[string]int64{}
+	for _, w := range s.windows() {
+		ents, err := os.ReadDir(s.windowDir(w))
+		if err != nil {
 			t.Fatal(err)
 		}
+		for _, e := range ents {
+			out[e.Name()] = w
+		}
 	}
-	s2, err := New(s.cfg)
-	if err != nil {
+	return out
+}
+
+// plant puts a file straight into a chosen window, which is how a test makes
+// the cache look old without waiting twenty minutes.
+func plant(t *testing.T, s *Store, w int64, name string, data []byte) {
+	t.Helper()
+	if err := os.MkdirAll(s.windowDir(w), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	return s2
+	if err := os.WriteFile(filepath.Join(s.windowDir(w), name), data, 0o644); err != nil {
+		t.Fatal(err)
+	}
 }
 
 // TestSigningKeyVector pins the SigV4 key derivation to the published AWS
@@ -182,9 +191,12 @@ func TestSigningKeyVector(t *testing.T) {
 	}
 }
 
-func TestRoundTripMultiChunk(t *testing.T) {
+// TestFillAndReadRoundTrip is the whole read path in one: put, upload, drop the
+// local copy, read it back out of the bucket through the chunk cache, and find
+// the chunk files sitting in the current window under their derivable names.
+func TestFillAndReadRoundTrip(t *testing.T) {
 	f := newFakeS3(t)
-	s := newStore(t, f, "epoch/", 4096, 1<<20)
+	s := newStore(t, f, "epoch/", 4096)
 
 	data := randBytes(4096*7+123, 1)
 	hash, err := s.Put(writeFile(t, s, data))
@@ -206,29 +218,265 @@ func TestRoundTripMultiChunk(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer file.Close()
-	if file.Size() != int64(len(data)) {
-		t.Fatalf("Size = %d, want %d", file.Size(), len(data))
-	}
 	if got := readAll(t, file); !bytes.Equal(got, data) {
-		t.Fatal("round trip bytes differ")
+		t.Fatalf("read back %d bytes, want %d identical", len(got), len(data))
 	}
 
-	// A fresh store with an empty spool and a cold cache must reproduce it.
-	s2 := newStore(t, f, "epoch/", 4096, 1<<20)
-	file2, err := s2.Open(hash)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer file2.Close()
-	if got := readAll(t, file2); !bytes.Equal(got, data) {
-		t.Fatal("cold-cache round trip bytes differ")
+	names := cachedNames(t, s)
+	cur := nowWindow()
+	for i := int64(0); i < nchunks(int64(len(data)), 4096); i++ {
+		name := chunkName(hash, i)
+		w, ok := names[name]
+		if !ok {
+			t.Fatalf("chunk %s was not cached", name)
+		}
+		if w != cur {
+			t.Fatalf("chunk %s landed in window %d, want the current one %d", name, w, cur)
+		}
 	}
 }
 
 func TestReadAtCrossesChunkBoundaries(t *testing.T) {
 	f := newFakeS3(t)
-	s := newStore(t, f, "", 1024, 1<<20)
-	data := randBytes(1024*9+7, 2)
+	s := newStore(t, f, "", 1024)
+	data := randBytes(1024*5+7, 2)
+	hash := f.seed("", data)
+
+	file, err := s.Open(hash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	for _, r := range [][2]int{{0, 1}, {1023, 2}, {1020, 1030}, {0, len(data)}, {len(data) - 3, 3}} {
+		p := make([]byte, r[1])
+		n, err := file.ReadAt(p, int64(r[0]))
+		if err != nil && !errors.Is(err, io.EOF) {
+			t.Fatalf("ReadAt(%d,%d): %v", r[0], r[1], err)
+		}
+		if !bytes.Equal(p[:n], data[r[0]:r[0]+n]) {
+			t.Fatalf("ReadAt(%d,%d) returned the wrong bytes", r[0], r[1])
+		}
+	}
+	if _, err := file.ReadAt(make([]byte, 4), int64(len(data))); !errors.Is(err, io.EOF) {
+		t.Fatalf("read past the end err=%v, want io.EOF", err)
+	}
+}
+
+// TestCacheHitNeedsNoNetwork warms the cache, then kills the S3 endpoint
+// entirely. Reads that hit cached chunks must still succeed.
+func TestCacheHitNeedsNoNetwork(t *testing.T) {
+	f := newFakeS3(t)
+	s := newStore(t, f, "", 1024)
+	data := randBytes(1024*3, 3)
+	hash := f.seed("", data)
+
+	file, err := s.Open(hash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := readAll(t, file); !bytes.Equal(got, data) {
+		t.Fatal("warm read differed")
+	}
+	file.Close()
+
+	f.Server.Close()
+	file2, err := s.Open(hash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file2.Close()
+	if got := readAll(t, file2); !bytes.Equal(got, data) {
+		t.Fatal("cached read differed with the endpoint gone")
+	}
+}
+
+// TestStartupWalkRebuildsTheMap is the only thing a restart does: one
+// name-only walk of the window tree, no journal, no marker, and every chunk
+// still readable with the endpoint dead.
+func TestStartupWalkRebuildsTheMap(t *testing.T) {
+	f := newFakeS3(t)
+	s := newStore(t, f, "", 1024)
+	data := randBytes(1024*4, 11)
+	hash := f.seed("", data)
+
+	file, err := s.Open(hash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	readAll(t, file)
+	file.Close()
+	before := cachedNames(t, s)
+	if len(before) != 4 {
+		t.Fatalf("cached %d chunks, want 4", len(before))
+	}
+
+	s2 := reopen(t, s)
+	s2.mu.Lock()
+	got := len(s2.where)
+	s2.mu.Unlock()
+	if got != len(before) {
+		t.Fatalf("startup walk mapped %d chunks, want %d", got, len(before))
+	}
+	// Sizes are not persisted, so a restart pays one HEAD per artifact it
+	// opens and nothing more: every byte after that comes off the walk.
+	file2, err := s2.Open(hash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file2.Close()
+	f.Server.Close()
+	if b := readAll(t, file2); !bytes.Equal(b, data) {
+		t.Fatal("post-restart read differed")
+	}
+}
+
+// TestAdmissionRefusesOverWatermark is the rule that replaced eviction on the
+// write path: over the watermark a fill is served from memory and NOT written,
+// and the moment there is room again fills resume. Nothing is ever deleted to
+// make space for a fill.
+func TestAdmissionRefusesOverWatermark(t *testing.T) {
+	f := newFakeS3(t)
+	var free atomic.Int64
+	free.Store(0) // full
+	s := newStore(t, f, "", 1024, fakeDisk(&free, 1<<20))
+	data := randBytes(1024*3, 4)
+	hash := f.seed("", data)
+
+	file, err := s.Open(hash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	if got := readAll(t, file); !bytes.Equal(got, data) {
+		t.Fatal("read over the watermark returned the wrong bytes")
+	}
+	if n := len(cachedNames(t, s)); n != 0 {
+		t.Fatalf("%d chunks cached while over the watermark, want 0", n)
+	}
+	// Every read refetches, because nothing is allowed to land: that is the
+	// degraded mode, and it is counted rather than hidden.
+	if st := s.Stats(); st.Refusals < 3 {
+		t.Fatalf("refusals = %d, want at least one per chunk", st.Refusals)
+	}
+
+	// A view is still complete over a disk that refuses everything: the bytes
+	// come from the heap instead of a mapping.
+	v, err := file.View(512, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer v.Close()
+	if !bytes.Equal(v.Slice(0, 2048), data[512:512+2048]) {
+		t.Fatal("view over an unwritable cache returned the wrong bytes")
+	}
+
+	free.Store(1 << 30) // room again
+	file2, err := s.Open(hash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file2.Close()
+	readAll(t, file2)
+	if n := len(cachedNames(t, s)); n != 3 {
+		t.Fatalf("%d chunks cached once under the watermark, want 3", n)
+	}
+}
+
+// TestWorkerDrainsOldestFirstAndStopsAtCurrent is the eviction contract: the
+// oldest non-current window goes first, whole, and when only the current
+// window is left the worker STOPS. A saturated cache freezes full rather than
+// eating its own fresh fills, which is what admission control is there for.
+func TestWorkerDrainsOldestFirstAndStopsAtCurrent(t *testing.T) {
+	f := newFakeS3(t)
+	var free atomic.Int64
+	free.Store(0) // permanently over the watermark
+	s := newStore(t, f, "", 1024, fakeDisk(&free, 1<<20))
+	stopped(t, s)
+
+	cur := nowWindow()
+	h := strings.Repeat("a", 64)
+	for i, w := range []int64{cur - 5, cur - 2, cur} {
+		for j := 0; j < 3; j++ {
+			plant(t, s, w, chunkName(h, int64(i*10+j)), []byte("x"))
+		}
+	}
+
+	for i := 0; i < 6; i++ {
+		if !s.evictOne() {
+			t.Fatalf("worker stopped after %d deletes, want 6", i)
+		}
+		if i < 3 && len(cachedNames(t, s)) != 9-i-1 {
+			t.Fatalf("delete %d did not remove exactly one file", i)
+		}
+	}
+	if s.evictOne() {
+		t.Fatal("worker deleted from the current window")
+	}
+	left := cachedNames(t, s)
+	if len(left) != 3 {
+		t.Fatalf("%d files left, want the current window's 3: %v", len(left), left)
+	}
+	for name, w := range left {
+		if w != cur {
+			t.Fatalf("%s survived in window %d, want only the current one", name, w)
+		}
+	}
+	// The drained windows are gone, not left as empty directories.
+	for _, w := range s.windows() {
+		if w != cur {
+			t.Fatalf("window %d was drained but not removed", w)
+		}
+	}
+	// The horizon is the age of what it actually deleted, not a setting.
+	if st := s.Stats(); st.Evictions != 6 || st.VictimAge != 2*windowMinutes*time.Minute {
+		t.Fatalf("stats = %+v, want 6 evictions and a 40m victim age", st)
+	}
+}
+
+// TestPromoteOnTouchFromAnyOlderWindow: reading a chunk in ANY older window
+// renames it into the current one. Promote-only-when-far-behind degrades to
+// FIFO under pressure, so the rule is deliberately greedy.
+func TestPromoteOnTouchFromAnyOlderWindow(t *testing.T) {
+	f := newFakeS3(t)
+	s := newStore(t, f, "", 1024)
+	data := randBytes(1024*2, 5)
+	hash := f.seed("", data)
+
+	cur := nowWindow()
+	// One chunk one window back, one chunk a day back: both must move.
+	plant(t, s, cur-1, chunkName(hash, 0), data[:1024])
+	plant(t, s, cur-72, chunkName(hash, 1), data[1024:])
+	s2 := reopen(t, s)
+
+	file, err := s2.Open(hash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	f.Server.Close() // the reads must be served from the cache, not refetched
+	if got := readAll(t, file); !bytes.Equal(got, data) {
+		t.Fatal("promoted read differed")
+	}
+	for name, w := range cachedNames(t, s2) {
+		if w != nowWindow() {
+			t.Fatalf("%s stayed in window %d after a read, want %d", name, w, nowWindow())
+		}
+	}
+	s2.mu.Lock()
+	defer s2.mu.Unlock()
+	for name, w := range s2.where {
+		if w != nowWindow() {
+			t.Fatalf("map still says %s is in window %d", name, w)
+		}
+	}
+}
+
+// TestSingleflightCollapsesConcurrentMisses: N readers landing on one cold
+// chunk together cost ONE ranged GET.
+func TestSingleflightCollapsesConcurrentMisses(t *testing.T) {
+	f := newFakeS3(t)
+	s := newStore(t, f, "", 1<<16)
+	data := randBytes(1<<16, 6)
 	hash := f.seed("", data)
 
 	file, err := s.Open(hash)
@@ -237,60 +485,357 @@ func TestReadAtCrossesChunkBoundaries(t *testing.T) {
 	}
 	defer file.Close()
 
-	// Every offset that straddles a boundary, plus spans of several chunks.
-	for _, span := range []int{1, 2, 1023, 1024, 1025, 2048, 4097} {
-		for _, off := range []int{0, 1, 1023, 1024, 1025, 2047, 5000, len(data) - span, len(data) - 1} {
-			if off < 0 {
-				continue
+	const readers = 32
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	errs := make(chan error, readers)
+	for i := 0; i < readers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			p := make([]byte, 64)
+			off := int64(i * 37)
+			if _, err := file.ReadAt(p, off); err != nil {
+				errs <- err
+				return
 			}
-			p := make([]byte, span)
-			n, err := file.ReadAt(p, int64(off))
-			want := min(len(data)-off, span)
-			if n != want {
-				t.Fatalf("ReadAt(off=%d,len=%d) n=%d, want %d", off, span, n, want)
+			if !bytes.Equal(p, data[off:off+64]) {
+				errs <- fmt.Errorf("reader %d got the wrong bytes", i)
 			}
-			if n < span && !errors.Is(err, io.EOF) {
-				t.Fatalf("ReadAt(off=%d,len=%d) short read err=%v, want io.EOF", off, span, err)
-			}
-			if n == span && err != nil {
-				t.Fatalf("ReadAt(off=%d,len=%d) err=%v", off, span, err)
-			}
-			if !bytes.Equal(p[:n], data[off:off+n]) {
-				t.Fatalf("ReadAt(off=%d,len=%d) bytes differ", off, span)
-			}
-		}
+		}(i)
 	}
-	if _, err := file.ReadAt(make([]byte, 4), file.Size()); !errors.Is(err, io.EOF) {
-		t.Fatalf("read past end err=%v, want io.EOF", err)
+	close(start)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatal(err)
+	}
+	if n := f.count("GET"); n != 1 {
+		t.Fatalf("%d GETs for one cold chunk, want 1", n)
 	}
 }
 
-// TestCacheHitNeedsNoNetwork warms the cache, then kills the S3 endpoint
-// entirely. Reads that hit cached chunks must still succeed.
-func TestCacheHitNeedsNoNetwork(t *testing.T) {
+// TestWholeWindowExpiresByAge: the TTL deletes window DIRECTORIES by name,
+// regardless of disk fill. It is safe because a promotion's target is always
+// the current window, so nothing anyone still reads can be sitting in one
+// named thirty days ago.
+func TestWholeWindowExpiresByAge(t *testing.T) {
 	f := newFakeS3(t)
-	s := newStore(t, f, "", 1024, 1<<20)
-	data := randBytes(1024*5, 3)
+	s := newStore(t, f, "", 1024, func(c *Config) { c.CacheMaxAge = time.Hour })
+	stopped(t, s)
+
+	cur := nowWindow()
+	h := strings.Repeat("b", 64)
+	plant(t, s, cur-10, chunkName(h, 0), []byte("old")) // 200 minutes back
+	plant(t, s, cur-1, chunkName(h, 1), []byte("new"))
+	s2 := reopen(t, s)
+	stopped(t, s2)
+
+	s2.sweep()
+	left := cachedNames(t, s2)
+	if _, ok := left[chunkName(h, 0)]; ok {
+		t.Fatal("a window past the max age survived")
+	}
+	if _, ok := left[chunkName(h, 1)]; !ok {
+		t.Fatal("a window inside the max age was expired")
+	}
+	s2.mu.Lock()
+	_, mapped := s2.where[chunkName(h, 0)]
+	s2.mu.Unlock()
+	if mapped {
+		t.Fatal("the expired window is still in the map")
+	}
+}
+
+// TestStrayTmpIsCollected: a fill killed between CreateTemp and the rename
+// leaves a tmp nothing will ever finish. It is never a chunk (the name is not
+// one) and it is collected once it is stale.
+func TestStrayTmpIsCollected(t *testing.T) {
+	f := newFakeS3(t)
+	s := newStore(t, f, "", 1024)
+	stopped(t, s)
+
+	cur := nowWindow()
+	h := strings.Repeat("c", 64)
+	fresh := chunkName(h, 0) + ".111.tmp"
+	stale := chunkName(h, 1) + ".222.tmp"
+	plant(t, s, cur, fresh, []byte("half"))
+	plant(t, s, cur, stale, []byte("half"))
+	old := time.Now().Add(-2 * tmpMaxAge)
+	if err := os.Chtimes(filepath.Join(s.windowDir(cur), stale), old, old); err != nil {
+		t.Fatal(err)
+	}
+
+	s.sweep()
+	left := cachedNames(t, s)
+	if _, ok := left[stale]; ok {
+		t.Fatal("a stale tmp was not collected")
+	}
+	if _, ok := left[fresh]; !ok {
+		t.Fatal("a tmp younger than the grace period was collected")
+	}
+	// And neither was ever mapped as a chunk.
+	s2 := reopen(t, s)
+	s2.mu.Lock()
+	defer s2.mu.Unlock()
+	if len(s2.where) != 0 {
+		t.Fatalf("tmp files were mapped as chunks: %v", s2.where)
+	}
+}
+
+// TestTornWriteNeverBecomesAChunk is the reason the fill fsyncs before it
+// renames. A half-written file only ever carries a tmp name, so a reader can
+// never open a correctly named chunk holding torn bytes: the read falls to S3
+// and comes back right.
+func TestTornWriteNeverBecomesAChunk(t *testing.T) {
+	f := newFakeS3(t)
+	s := newStore(t, f, "", 1024)
+	stopped(t, s)
+	data := randBytes(1024*2, 8)
+	hash := f.seed("", data)
+
+	cur := nowWindow()
+	torn := chunkName(hash, 0) + ".999.tmp"
+	plant(t, s, cur, torn, data[:100]) // the write died a tenth of the way in
+
+	s2 := reopen(t, s)
+	if _, ok := cachedNames(t, s2)[chunkName(hash, 0)]; ok {
+		t.Fatal("a torn tmp became a named chunk")
+	}
+	file, err := s2.Open(hash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	if got := readAll(t, file); !bytes.Equal(got, data) {
+		t.Fatal("the read after a torn write did not come back correct")
+	}
+}
+
+// TestReadsTolerateChunksVanishing is ENOENT tolerance end to end: a sibling
+// process (here, a goroutine) deleting the whole cache under live readers
+// costs refetches and nothing else. Every answer stays byte-correct.
+func TestReadsTolerateChunksVanishing(t *testing.T) {
+	f := newFakeS3(t)
+	s := newStore(t, f, "", 4096)
+	data := randBytes(4096*16, 9)
+	hash := f.seed("", data)
+
+	stop := make(chan struct{})
+	var deleter sync.WaitGroup
+	deleter.Add(1)
+	go func() {
+		defer deleter.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			for _, w := range s.windows() {
+				os.RemoveAll(s.windowDir(w))
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}()
+
+	var wg sync.WaitGroup
+	errs := make(chan error, 8)
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			file, err := s.Open(hash)
+			if err != nil {
+				errs <- err
+				return
+			}
+			defer file.Close()
+			for r := 0; r < 20; r++ {
+				off := int64((i*7 + r*131) % (len(data) - 900))
+				p := make([]byte, 900)
+				if _, err := file.ReadAt(p, off); err != nil {
+					errs <- err
+					return
+				}
+				if !bytes.Equal(p, data[off:off+900]) {
+					errs <- fmt.Errorf("reader %d round %d read the wrong bytes at %d", i, r, off)
+					return
+				}
+			}
+		}(i)
+	}
+	wg.Wait()
+	close(stop)
+	deleter.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatal(err)
+	}
+}
+
+// TestPreWindowCacheIsWiped covers the one-way trip off the sparse per-artifact
+// cache: those files are simply not ours, and the cache is disposable, so
+// there is no migration, only a delete.
+func TestPreWindowCacheIsWiped(t *testing.T) {
+	f := newFakeS3(t)
+	s := newStore(t, f, "", 1024)
+	stopped(t, s)
+
+	h := strings.Repeat("d", 64)
+	shard := filepath.Join(s.cfg.CacheDir, h[:2])
+	if err := os.MkdirAll(shard, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(shard, h), randBytes(4096, 10), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(s.cfg.CacheDir, ".clean"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	s2 := reopen(t, s)
+	ents, err := os.ReadDir(s2.cfg.CacheDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ents) != 0 {
+		t.Fatalf("pre-window cache survived: %v", ents)
+	}
+}
+
+// TestViewSpansChunksAndCopiesAtBoundary is the whole cost of chunk files not
+// being contiguous. Inside a chunk a slice aliases the mapping; across a
+// boundary it is a copy, and either way the bytes are right.
+func TestViewSpansChunksAndCopiesAtBoundary(t *testing.T) {
+	f := newFakeS3(t)
+	s := newStore(t, f, "", 1024)
+	data := randBytes(1024*5, 12)
 	hash := f.seed("", data)
 
 	file, err := s.Open(hash)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := readAll(t, file); !bytes.Equal(got, data) {
-		t.Fatal("warmup bytes differ")
-	}
-	file.Close()
-
-	f.Server.Close() // any further network call now fails
-
-	file2, err := s.Open(hash)
+	defer file.Close()
+	v, err := file.View(500, 3000)
 	if err != nil {
-		t.Fatalf("Open after shutdown: %v", err)
+		t.Fatal(err)
 	}
-	defer file2.Close()
-	if got := readAll(t, file2); !bytes.Equal(got, data) {
-		t.Fatal("cache hit bytes differ")
+	defer v.Close()
+	if v.Len() != 3000 {
+		t.Fatalf("view length %d, want 3000", v.Len())
+	}
+	if !bytes.Equal(v.Slice(0, 3000), data[500:3500]) {
+		t.Fatal("whole-view slice differed")
+	}
+	// Inside one chunk: the same memory, not a copy.
+	a := v.Slice(0, 100)
+	b := v.Slice(0, 100)
+	if &a[0] != &b[0] {
+		t.Fatal("an in-chunk slice was copied")
+	}
+	// Across the boundary at absolute 1024, i.e. view offset 524.
+	straddle := v.Slice(520, 16)
+	if !bytes.Equal(straddle, data[1020:1036]) {
+		t.Fatal("straddling slice differed")
+	}
+	if &straddle[0] == &v.Slice(520, 16)[0] {
+		t.Fatal("a straddling slice aliased a mapping, which cannot be contiguous")
+	}
+	// The mapping outlives the file it came from: eviction is an unlink, and
+	// unlinking never disturbs a mapping.
+	for _, w := range s.windows() {
+		os.RemoveAll(s.windowDir(w))
+	}
+	if !bytes.Equal(v.Slice(0, 3000), data[500:3500]) {
+		t.Fatal("view changed when its chunk files were unlinked")
+	}
+}
+
+// TestViewFromSpoolSurvivesRelease maps the spool file directly and keeps
+// working across the Release that unlinks it.
+func TestViewFromSpoolSurvivesRelease(t *testing.T) {
+	f := newFakeS3(t)
+	s := newStore(t, f, "", 1024)
+	data := randBytes(1024*3, 13)
+	hash := hashOf(data)
+	spool(t, s, hash, data)
+
+	file, err := s.Open(hash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	v, err := file.View(0, int64(len(data)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer v.Close()
+
+	mustSync(t, s)
+	if err := s.Release(hash); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(v.Slice(0, int64(len(data))), data) {
+		t.Fatal("the spool mapping changed after Release")
+	}
+	if got := readAll(t, file); !bytes.Equal(got, data) {
+		t.Fatal("reads through a released spool descriptor differed")
+	}
+	// Nothing was cached: the artifact was local the whole time.
+	if n := len(cachedNames(t, s)); n != 0 {
+		t.Fatalf("%d chunks cached for a spool-resident artifact, want 0", n)
+	}
+}
+
+// TestSpoolToRemoteTransition walks the lifecycle: while the file is local
+// every read is a pread of the spool file, and only once it is released and
+// reopened does anything reach S3, through the chunk cache.
+func TestSpoolToRemoteTransition(t *testing.T) {
+	f := newFakeS3(t)
+	s := newStore(t, f, "", 1024)
+	data := randBytes(1024*6, 14)
+	hash := hashOf(data)
+	spool(t, s, hash, data)
+
+	local, err := s.Open(hash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := readAll(t, local); !bytes.Equal(got, data) {
+		t.Fatal("spool-resident read differed")
+	}
+	local.Close()
+	if n := f.count("GET"); n != 0 {
+		t.Fatalf("%d GETs while the file was local, want 0", n)
+	}
+
+	mustSync(t, s)
+	if err := s.Release(hash); err != nil {
+		t.Fatal(err)
+	}
+	remote, err := s.Open(hash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer remote.Close()
+	if got := readAll(t, remote); !bytes.Equal(got, data) {
+		t.Fatal("post-release read differed")
+	}
+	if n := f.count("GET"); n != 6 {
+		t.Fatalf("%d GETs for 6 cold chunks, want 6", n)
+	}
+	// And now it is warm: reading it again touches nothing.
+	again, err := s.Open(hash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer again.Close()
+	readAll(t, again)
+	if n := f.count("GET"); n != 6 {
+		t.Fatalf("%d GETs after warming, want 6", n)
 	}
 }
 
@@ -300,38 +845,27 @@ func TestCacheHitNeedsNoNetwork(t *testing.T) {
 // there is no ack that a kill can lose.
 func TestSpoolRenameSurvivesRestart(t *testing.T) {
 	f := newFakeS3(t)
-	s := newStore(t, f, "v1/", 1024, 1<<20)
-	data := randBytes(1024*4+9, 10)
+	s := newStore(t, f, "epoch/", 1024)
+	data := randBytes(4000, 15)
 	hash := hashOf(data)
 	spool(t, s, hash, data)
 
-	// The kill: this store never learns anything about the file.
-	restarted := reopen(t, s)
-
-	file, err := restarted.Open(hash)
+	s2 := reopen(t, s)
+	file, err := s2.Open(hash)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if f.count("HEAD")+f.count("GET") != 0 {
-		t.Fatal("Open of a spooled hash touched the network")
-	}
 	if got := readAll(t, file); !bytes.Equal(got, data) {
-		t.Fatal("spooled bytes differ")
+		t.Fatal("read after restart differed")
 	}
 	file.Close()
-	if f.count("GET") != 0 {
-		t.Fatalf("reading a spooled file issued %d GETs", f.count("GET"))
-	}
-
-	done := mustSync(t, restarted)
-	if len(done) != 1 || done[0] != hash {
-		t.Fatalf("Sync after restart confirmed %v, want [%s]", done, hash)
+	if done := mustSync(t, s2); len(done) != 1 || done[0] != hash {
+		t.Fatalf("Sync confirmed %v, want [%s]", done, hash)
 	}
 	f.mu.Lock()
-	stored := f.objects["v1/"+hash]
-	f.mu.Unlock()
-	if !bytes.Equal(stored, data) {
-		t.Fatal("uploaded object differs from the spool file")
+	defer f.mu.Unlock()
+	if !bytes.Equal(f.objects["epoch/"+hash], data) {
+		t.Fatal("the bucket does not hold the spooled bytes")
 	}
 }
 
@@ -339,757 +873,34 @@ func TestSpoolRenameSurvivesRestart(t *testing.T) {
 // as they stream, and that the endpoint refuses to store them.
 func TestSpoolNameMismatchRejected(t *testing.T) {
 	f := newFakeS3(t)
-	s := newStore(t, f, "", 1024, 1<<20)
+	s := newStore(t, f, "", 1024)
+	name := hashOf([]byte("one thing"))
+	spool(t, s, name, []byte("quite another"))
 
-	honest := randBytes(2000, 11)
-	liar := hashOf(randBytes(2000, 12)) // a name that does not describe the bytes
-	spool(t, s, liar, honest)
-	good := hashOf(honest)
-	spool(t, s, good, honest)
-
-	done, err := s.Sync()
-	if err == nil {
-		t.Fatal("Sync accepted a spool file whose name lies about its contents")
-	}
-	if !strings.Contains(err.Error(), liar) {
-		t.Fatalf("error does not name the offending file: %v", err)
-	}
-	// The honest neighbour still went up: one bad entry must not stall the rest.
-	if len(done) != 1 || done[0] != good {
-		t.Fatalf("Sync confirmed %v, want [%s]", done, good)
+	if _, err := s.Sync(); err == nil || !strings.Contains(err.Error(), "refusing it") {
+		t.Fatalf("Sync err=%v, want the name/content mismatch", err)
 	}
 	f.mu.Lock()
-	_, stored := f.objects[liar]
-	f.mu.Unlock()
-	if stored {
-		t.Fatal("mismatched content was stored under the claimed hash")
-	}
-	if err := s.Release(liar); err == nil {
-		t.Fatal("Release dropped a spool file that was never uploaded")
-	}
-	if _, err := os.Stat(s.SpoolPath(liar)); err != nil {
-		t.Fatalf("rejected spool file was removed: %v", err)
+	defer f.mu.Unlock()
+	if _, ok := f.objects[name]; ok {
+		t.Fatal("mismatched bytes were stored")
 	}
 }
 
-// TestSpoolToRemoteTransition walks the whole lifecycle through the single read
-// path. Ranges read while the file is spool-resident are filled by pread and
-// land in the chunk cache like any other chunk, so Release changes nothing for
-// them. Only genuinely cold ranges, once the chunks are gone, reach S3.
-func TestSpoolToRemoteTransition(t *testing.T) {
+// TestStatsReportWhatHappened: the numbers are observations, not settings, and
+// the horizon is empty until something is actually evicted.
+func TestStatsReportWhatHappened(t *testing.T) {
 	f := newFakeS3(t)
-	const cs = 4096
-	s := newStore(t, f, "", cs, 1<<20)
-
-	data := randBytes(cs*6+11, 4)
-	path := writeFile(t, s, data)
-	hash, err := s.Put(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := os.Stat(path); !errors.Is(err, fs.ErrNotExist) {
-		t.Fatalf("Put left the original in place: %v", err)
-	}
-	if f.count("GET")+f.count("HEAD")+f.count("PUT") != 0 {
-		t.Fatal("Put touched the network")
-	}
-
-	file, err := s.Open(hash)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer file.Close()
-
-	const hotOff, hotSpan = cs*2 - 17, cs*2 + 33 // straddles three chunks
-	hot := make([]byte, hotSpan)
-	if _, err := file.ReadAt(hot, hotOff); err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(hot, data[hotOff:hotOff+hotSpan]) {
-		t.Fatal("spool-resident read differs from source")
-	}
-	if f.count("GET") != 0 {
-		t.Fatal("spool-resident read went to the network")
-	}
-	// The pread went through the chunk cache like everything else.
-	if s.CacheUsage() == 0 {
-		t.Fatal("spool-resident read did not populate the chunk cache")
-	}
-
-	// The spool file is the durable copy until the upload is confirmed.
-	if err := s.Release(hash); err == nil {
-		t.Fatal("Release succeeded before Sync")
-	}
-	if _, err := os.Stat(s.SpoolPath(hash)); err != nil {
-		t.Fatalf("failed Release removed the spool file: %v", err)
-	}
-
-	mustSync(t, s)
-	if err := s.Release(hash); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := os.Stat(s.SpoolPath(hash)); !errors.Is(err, fs.ErrNotExist) {
-		t.Fatalf("Release left the spool file behind: %v", err)
-	}
-
-	// Warm chunks survive Release, so the transition is invisible.
-	before := f.count("GET")
-	again := make([]byte, hotSpan)
-	if _, err := file.ReadAt(again, hotOff); err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(again, hot) {
-		t.Fatal("post-release read of a warm range differs")
-	}
-	if f.count("GET") != before {
-		t.Fatalf("warm range went to S3 after Release: %d GETs", f.count("GET")-before)
-	}
-
-	// Once those chunks are evicted, and only then, S3 serves the bytes.
-	s2 := wipeCache(t, s)
-	file2, err := s2.Open(hash)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer file2.Close()
-	cold := make([]byte, hotSpan)
-	if _, err := file2.ReadAt(cold, hotOff); err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(cold, hot) {
-		t.Fatal("post-eviction read differs")
-	}
-	if f.count("GET") <= before {
-		t.Fatal("post-eviction read never reached S3")
-	}
-	if got := readAll(t, file2); !bytes.Equal(got, data) {
-		t.Fatal("whole file differs after eviction")
-	}
-}
-
-func TestEvictionUnderConcurrentReaders(t *testing.T) {
-	f := newFakeS3(t)
-	const chunkSize = 4096
-	s := newStore(t, f, "", chunkSize, 3*chunkSize) // room for three chunks
-	data := randBytes(chunkSize*20, 5)
-	hash := f.seed("", data)
-
-	var wg sync.WaitGroup
-	for g := 0; g < 8; g++ {
-		wg.Add(1)
-		go func(g int) {
-			defer wg.Done()
-			rng := rand.New(rand.NewSource(int64(g)))
-			file, err := s.Open(hash)
-			if err != nil {
-				t.Error(err)
-				return
-			}
-			defer file.Close()
-			for i := 0; i < 150; i++ {
-				off := rng.Intn(len(data))
-				span := min(1+rng.Intn(3*chunkSize), len(data)-off)
-				if i%2 == 0 { // half the traffic is pinned zero-copy views
-					if err := file.Pin(int64(off), int64(span)); err != nil {
-						t.Error(err)
-						return
-					}
-					v, err := file.View(int64(off), int64(span))
-					if err == nil && !bytes.Equal(v, data[off:off+span]) {
-						err = errors.New("bytes differ")
-					}
-					if e := file.Unpin(int64(off), int64(span)); err == nil {
-						err = e
-					}
-					if err != nil {
-						t.Errorf("View(%d,%d): %v", off, span, err)
-						return
-					}
-					continue
-				}
-				p := make([]byte, span)
-				if _, err := file.ReadAt(p, int64(off)); err != nil {
-					t.Errorf("ReadAt(%d,%d): %v", off, span, err)
-					return
-				}
-				if !bytes.Equal(p, data[off:off+span]) {
-					t.Errorf("ReadAt(%d,%d): bytes differ", off, span)
-					return
-				}
-			}
-		}(g)
-	}
-	wg.Wait()
-
-	if u := s.CacheUsage(); u > 3*chunkSize {
-		t.Fatalf("cache usage %d over cap %d", u, 3*chunkSize)
-	}
-	// The sparse file still has the object's full length, so only allocated
-	// blocks say anything. Allow one block of extent-tree overhead.
-	if onDisk := cacheBlocks(t, s) * 512; onDisk > 4*chunkSize {
-		t.Fatalf("allocated cache bytes %d over cap %d", onDisk, 3*chunkSize)
-	}
-	if fi, err := os.Stat(s.cachePath(hash)); err != nil || fi.Size() != int64(len(data)) {
-		t.Fatalf("cache file size %v (%v), want %d", fi.Size(), err, len(data))
-	}
-}
-
-// TestPresenceSurvivesCleanRestart is the SEEK_DATA contract: after a clean
-// restart nothing but the sparse file's extent map says which chunks are
-// cached, and it has to be right, chunk by chunk, with no index anywhere.
-func TestPresenceSurvivesCleanRestart(t *testing.T) {
-	f := newFakeS3(t)
-	const cs = 4096
-	s := newStore(t, f, "", cs, 1<<20)
-	data := randBytes(cs*8+13, 6)
-	hash := f.seed("", data)
-
-	file, err := s.Open(hash)
-	if err != nil {
-		t.Fatal(err)
-	}
-	// Fill an interleaved subset, so recovery has to distinguish real holes
-	// from data rather than round a whole file up or down.
-	want := []int64{0, 3, 4, 8}
-	for _, i := range want {
-		if _, err := file.ReadAt(make([]byte, 8), i*cs); err != nil {
-			t.Fatal(err)
-		}
-	}
-	file.Close()
-
-	s2 := reopen(t, s)
-	defer s2.Close()
-	a, err := s2.artifact(hash, int64(len(data)))
-	if err != nil {
-		t.Fatal(err)
-	}
-	var got []int64
-	for i := int64(0); i < nchunks(a.size, cs); i++ {
-		if a.has(i) {
-			got = append(got, i)
-		}
-	}
-	if len(got) != len(want) {
-		t.Fatalf("recovered chunks %v, want %v", got, want)
-	}
-	for i := range want {
-		if got[i] != want[i] {
-			t.Fatalf("recovered chunks %v, want %v", got, want)
-		}
-	}
-	var wantBytes int64
-	for _, i := range want {
-		wantBytes += chunkLen(a.size, cs, i)
-	}
-	if s2.CacheUsage() != wantBytes {
-		t.Fatalf("recovered cache usage %d, want %d", s2.CacheUsage(), wantBytes)
-	}
-
-	// Recovered means usable: those ranges must serve with no network at all.
-	f.Server.Close()
-	file2, err := s2.Open(hash)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer file2.Close()
-	for _, i := range want {
-		p := make([]byte, min(int64(cs), int64(len(data))-i*cs))
-		if _, err := file2.ReadAt(p, i*cs); err != nil {
-			t.Fatalf("chunk %d after restart: %v", i, err)
-		}
-		if !bytes.Equal(p, data[i*cs:i*cs+int64(len(p))]) {
-			t.Fatalf("chunk %d bytes differ after restart", i)
-		}
-	}
-}
-
-// TestUncleanShutdownWipesCache is the crash-safety choice, stated as a test.
-// A chunk fill is one pwrite with no atomicity, so a process that dies with
-// dirty pages can leave an extent that SEEK_DATA calls present and that reads
-// back half zeros. The marker Close writes is the only evidence that did not
-// happen; without it the whole cache goes, because it is disposable and a
-// refill is one ranged GET.
-func TestUncleanShutdownWipesCache(t *testing.T) {
-	f := newFakeS3(t)
-	const cs = 1024
-	s := newStore(t, f, "", cs, 1<<20)
-	data := randBytes(cs*4, 6)
-	hash := f.seed("", data)
-
-	file, err := s.Open(hash)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := readAll(t, file); !bytes.Equal(got, data) {
-		t.Fatal("warmup bytes differ")
-	}
-	file.Close()
-	if blocks(t, s.cachePath(hash)) == 0 {
-		t.Fatal("warmup allocated nothing")
-	}
-
-	// The kill: no Close, so no clean marker. Plant a torn chunk to stand in
-	// for the half-flushed pwrite that motivates all of this.
-	torn, err := os.OpenFile(s.cachePath(hash), os.O_RDWR, 0o644)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := torn.WriteAt(make([]byte, cs/2), cs); err != nil {
-		t.Fatal(err)
-	}
-	torn.Close()
-
-	s2, err := New(s.cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer s2.Close()
-	if s2.CacheUsage() != 0 {
-		t.Fatalf("unclean restart kept %d cached bytes", s2.CacheUsage())
-	}
-	if _, err := os.Stat(s2.cachePath(hash)); !errors.Is(err, fs.ErrNotExist) {
-		t.Fatalf("unclean restart kept the cache file: %v", err)
-	}
-	file2, err := s2.Open(hash)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer file2.Close()
-	if got := readAll(t, file2); !bytes.Equal(got, data) {
-		t.Fatal("bytes differ after the wipe")
-	}
-}
-
-// TestOldChunkLayoutIsDeleted covers the one-way trip off the per-chunk cache:
-// there is no compatibility, the files are simply not ours.
-func TestOldChunkLayoutIsDeleted(t *testing.T) {
-	f := newFakeS3(t)
-	s := newStore(t, f, "", 1024, 1<<20)
-	data := randBytes(2048, 30)
-	hash := f.seed("", data)
-
-	dir := filepath.Join(s.cfg.CacheDir, hash[:2])
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	old := []string{hash + ".0", hash + ".1", hash + ".1.tmp12345"}
-	for _, name := range old {
-		if err := os.WriteFile(filepath.Join(dir, name), data[:1024], 0o644); err != nil {
-			t.Fatal(err)
-		}
-	}
-	s2 := reopen(t, s)
-	defer s2.Close()
-	for _, name := range old {
-		if _, err := os.Stat(filepath.Join(dir, name)); !errors.Is(err, fs.ErrNotExist) {
-			t.Fatalf("old-layout file %s survived: %v", name, err)
-		}
-	}
-	if s2.CacheUsage() != 0 {
-		t.Fatalf("old-layout files were counted as cache: %d", s2.CacheUsage())
-	}
-}
-
-func mtimeOf(t *testing.T, path string) time.Time {
-	t.Helper()
-	fi, err := os.Stat(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return fi.ModTime()
-}
-
-// TestTouchOnReadIsThrottled proves a cache hit refreshes the artifact's mtime
-// at most once per TouchInterval, however hard it is read.
-func TestTouchOnReadIsThrottled(t *testing.T) {
-	f := newFakeS3(t)
-	// The interval sits well clear of this filesystem's 4ms mtime granularity.
-	const cs, interval = 1024, 50 * time.Millisecond
-	s := newStore(t, f, "", cs, 1<<20)
-	s.cfg.TouchInterval = interval // set before any concurrent use
-	data := randBytes(cs*3, 20)
-	hash := f.seed("", data)
-
-	file, err := s.Open(hash)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer file.Close()
-	p := make([]byte, 8)
-	if _, err := file.ReadAt(p, 0); err != nil { // fills chunk 0
-		t.Fatal(err)
-	}
-	path := s.cachePath(hash)
-	first := mtimeOf(t, path)
-
-	for i := 0; i < 50; i++ { // all inside the interval, all hits
-		if _, err := file.ReadAt(p, int64(i)); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if got := mtimeOf(t, path); !got.Equal(first) {
-		t.Fatalf("mtime moved %v within the throttle interval", got.Sub(first))
-	}
-
-	time.Sleep(interval + interval/2)
-	if _, err := file.ReadAt(p, 0); err != nil {
-		t.Fatal(err)
-	}
-	second := mtimeOf(t, path)
-	if !second.After(first) {
-		t.Fatal("mtime did not advance after the throttle interval elapsed")
-	}
-	for i := 0; i < 50; i++ {
-		if _, err := file.ReadAt(p, int64(i)); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if got := mtimeOf(t, path); !got.Equal(second) {
-		t.Fatalf("mtime moved again within the interval, by %v", got.Sub(second))
-	}
-
-	// Negative disables it outright.
-	s.cfg.TouchInterval = -1
-	time.Sleep(interval + interval/2)
-	if _, err := file.ReadAt(p, 0); err != nil {
-		t.Fatal(err)
-	}
-	if got := mtimeOf(t, path); !got.Equal(second) {
-		t.Fatal("negative TouchInterval still touched the chunk")
-	}
-}
-
-// TestTouchKeepsRestartSeedFresh is the reason touching exists: an artifact
-// fetched long ago but read constantly must outrank a newer one nobody reads
-// once the process restarts and the LRU is reseeded from mtime. Ages are
-// planted rather than slept out, since mtime granularity here is 4ms.
-//
-// The seed is per artifact now, not per chunk, because there is one file per
-// artifact to carry an mtime. Two artifacts, one chunk each.
-func TestTouchKeepsRestartSeedFresh(t *testing.T) {
-	f := newFakeS3(t)
-	// Two filesystem blocks per chunk, so a punch has whole blocks to free and
-	// the eviction is visible in st_blocks.
-	const cs = 8192
-	s := newStore(t, f, "", cs, 1<<20)
-	hotHash := f.seed("", randBytes(cs, 21))
-	coldHash := f.seed("", randBytes(cs, 22))
-
-	p := make([]byte, 8)
-	for _, h := range []string{hotHash, coldHash} {
-		file, err := s.Open(h)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if _, err := file.ReadAt(p, 0); err != nil {
-			t.Fatal(err)
-		}
-		file.Close()
-	}
-
-	// The hot artifact is the older of the two on disk, and is about to become
-	// the hot one. The cold one is newer and never read again.
-	hot, cold := s.cachePath(hotHash), s.cachePath(coldHash)
-	now := time.Now()
-	for path, age := range map[string]time.Duration{hot: 2 * time.Hour, cold: time.Hour} {
-		if err := os.Chtimes(path, now.Add(-age), now.Add(-age)); err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	// Restart: the LRU is reseeded from those mtimes, so the hot artifact
-	// starts last in line. One read is enough to lift it.
-	s2 := reopen(t, s)
-	file2, err := s2.Open(hotHash)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer file2.Close()
-	if _, err := file2.ReadAt(p, 0); err != nil {
-		t.Fatal(err)
-	}
-	if !mtimeOf(t, hot).After(mtimeOf(t, cold)) {
-		t.Fatal("touch did not lift the hot artifact above the cold one")
-	}
-
-	// Restart again with room for exactly one chunk. The seed must keep the
-	// touched one, which without touching would have been evicted first.
-	cfg := s2.cfg
-	cfg.CacheBytes = cs
-	if err := s2.Close(); err != nil {
-		t.Fatal(err)
-	}
-	s3, err := New(cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer s3.Close()
-	if blocks(t, hot) == 0 {
-		t.Fatal("restart evicted the touched artifact")
-	}
-	if blocks(t, cold) != 0 {
-		t.Fatal("restart kept the untouched artifact")
-	}
-	if s3.CacheUsage() != cs {
-		t.Fatalf("post-restart usage %d, want %d", s3.CacheUsage(), cs)
-	}
-}
-
-// TestViewIsZeroCopy proves View hands back the mapping itself and not a copy:
-// two Views of overlapping ranges are the same memory, and the whole object is
-// readable through it.
-func TestViewIsZeroCopy(t *testing.T) {
-	f := newFakeS3(t)
-	const cs = 4096
-	s := newStore(t, f, "", cs, 1<<20)
-	defer s.Close()
-	data := randBytes(cs*5+77, 40)
-	hash := f.seed("", data)
-
-	file, err := s.Open(hash)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer file.Close()
-
-	const off, n = cs + 7, cs * 2 // straddles three chunks
-	v, err := file.View(off, n)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(v, data[off:off+n]) {
-		t.Fatal("View bytes differ")
-	}
-	v2, err := file.View(off, 16)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if &v2[0] != &v[0] {
-		t.Fatal("View copied instead of aliasing the mapping")
-	}
-
-	// A range nobody has touched yet is filled by the View itself.
-	before := f.count("GET")
-	whole, err := file.View(0, file.Size())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(whole, data) {
-		t.Fatal("whole-object View differs")
-	}
-	if f.count("GET") <= before {
-		t.Fatal("View of an uncached range fetched nothing")
-	}
-	if &whole[off] != &v[0] {
-		t.Fatal("the second View is a different mapping")
-	}
-	if _, err := file.View(1, file.Size()); err == nil {
-		t.Fatal("View past the end was accepted")
-	}
-}
-
-// TestViewFromSpool maps the spool file directly, and keeps working across the
-// Release that unlinks it, because unlinking never disturbs a mapping.
-func TestViewFromSpool(t *testing.T) {
-	f := newFakeS3(t)
-	const cs = 1024
-	s := newStore(t, f, "", cs, 1<<20)
-	defer s.Close()
-	data := randBytes(cs*3+5, 41)
-	hash, err := s.Put(writeFile(t, s, data))
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	file, err := s.Open(hash)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer file.Close()
-	v, err := file.View(0, file.Size())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(v, data) {
-		t.Fatal("spool View differs")
-	}
-	if s.CacheUsage() != 0 {
-		t.Fatal("a spool-resident View populated the chunk cache")
-	}
-
-	mustSync(t, s)
-	if err := s.Release(hash); err != nil {
-		t.Fatal(err)
-	}
-	f.Server.Close()
-	if !bytes.Equal(v, data) {
-		t.Fatal("spool View changed under Release")
-	}
-	v2, err := file.View(cs, cs)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(v2, data[cs:cs*2]) {
-		t.Fatal("spool View after Release differs")
-	}
-}
-
-// TestPunchFreesBlocks is the point of the sparse layout: eviction has to give
-// the blocks back to the filesystem, and the file's length cannot say whether
-// it did.
-func TestPunchFreesBlocks(t *testing.T) {
-	f := newFakeS3(t)
-	const cs = 64 << 10 // a multiple of the 4K block size, so a punch frees whole blocks
-	const cap = 4 * cs
-	s := newStore(t, f, "", cs, cap)
-	defer s.Close()
-	data := randBytes(cs*8, 42)
-	hash := f.seed("", data)
-
-	file, err := s.Open(hash)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer file.Close()
-
-	p := make([]byte, 8)
-	for i := int64(0); i < 4; i++ { // fill up to the cap, nothing evicted yet
-		if _, err := file.ReadAt(p, i*cs); err != nil {
-			t.Fatal(err)
-		}
-	}
-	full := blocks(t, s.cachePath(hash)) * 512
-	if full < cap {
-		t.Fatalf("four chunks allocated %d bytes, want at least %d", full, cap)
-	}
-
-	for i := int64(4); i < 8; i++ { // every one of these punches an older chunk
-		if _, err := file.ReadAt(p, i*cs); err != nil {
-			t.Fatal(err)
-		}
-	}
-	after := blocks(t, s.cachePath(hash)) * 512
-	t.Logf("8 chunks of %d bytes read under a %d byte cap: file length %d, allocated %d (peak resident %d)",
-		cs, cap, file.Size(), after, full)
-	if after > full+cs {
-		t.Fatalf("allocated %d bytes after eviction, want about %d: punching freed nothing", after, cap)
-	}
-	if s.CacheUsage() != cap {
-		t.Fatalf("cache usage %d, want %d", s.CacheUsage(), cap)
-	}
-	if fi, _ := os.Stat(s.cachePath(hash)); fi.Size() != int64(len(data)) {
-		t.Fatalf("punching changed the file length to %d, want %d", fi.Size(), len(data))
-	}
-	if got := readAll(t, file); !bytes.Equal(got, data) {
-		t.Fatal("bytes differ after punching")
-	}
-}
-
-// TestPinSurvivesEvictionPressure is the correctness piece the whole design
-// hangs on. A punched page reads back as zeros with no error, so a consumer
-// holding a live mmap of a range needs that range to be untouchable. It also
-// shows the hazard directly: once unpinned, the same view goes to zeros.
-func TestPinSurvivesEvictionPressure(t *testing.T) {
-	f := newFakeS3(t)
-	const cs = 4096
-	s := newStore(t, f, "", cs, 3*cs)
-	defer s.Close()
-	data := randBytes(cs*20, 43)
-	hash := f.seed("", data)
-
-	file, err := s.Open(hash)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer file.Close()
-
-	if err := file.Pin(0, cs); err != nil {
-		t.Fatal(err)
-	}
-	view, err := file.View(0, cs)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(view, data[:cs]) {
-		t.Fatal("pinned View differs")
-	}
-
-	pressure := func() {
-		p := make([]byte, 8)
-		for i := int64(1); i < 20; i++ {
-			if _, err := file.ReadAt(p, i*cs); err != nil {
-				t.Fatal(err)
-			}
-		}
-	}
-	pressure()
-	pressure()
-
-	a, err := s.artifact(hash, file.Size())
-	if err != nil {
-		t.Fatal(err)
-	}
-	s.mu.Lock()
-	present := a.has(0)
-	s.mu.Unlock()
-	if !present {
-		t.Fatal("the pinned chunk was evicted")
-	}
-	if !bytes.Equal(view, data[:cs]) {
-		t.Fatal("the pinned View was punched out from under the reader")
-	}
-
-	// Unpin, and the same range becomes ordinary cache: the next round of
-	// pressure punches it and the still-live view silently reads zeros. This
-	// is exactly what Pin exists to prevent, so it is worth asserting.
-	if err := file.Unpin(0, cs); err != nil {
-		t.Fatal(err)
-	}
-	if err := file.Unpin(0, cs); err == nil {
-		t.Fatal("Unpin of an unpinned range was accepted")
-	}
-	pressure()
-	s.mu.Lock()
-	present = a.has(0)
-	s.mu.Unlock()
-	if present {
-		t.Fatal("the unpinned chunk was never evicted, so the test proves nothing")
-	}
-	if !bytes.Equal(view, make([]byte, cs)) {
-		t.Fatal("a punched range did not read back as zeros, and the hazard is misdescribed")
-	}
-	// ReadAt still answers correctly, because it refills before reading.
-	p := make([]byte, cs)
-	if _, err := file.ReadAt(p, 0); err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(p, data[:cs]) {
-		t.Fatal("refilled read differs")
-	}
-}
-
-func TestPointers(t *testing.T) {
-	f := newFakeS3(t)
-	s := newStore(t, f, "epoch/", 1024, 1<<20)
-
-	if _, err := s.GetPointer("latest"); !errors.Is(err, fs.ErrNotExist) {
-		t.Fatalf("missing pointer err=%v, want fs.ErrNotExist", err)
-	}
-	if err := s.SetPointer("latest", "abc123"); err != nil {
-		t.Fatal(err)
-	}
-	if v, err := s.GetPointer("latest"); err != nil || v != "abc123" {
-		t.Fatalf("GetPointer = %q, %v", v, err)
-	}
-	if err := s.SetPointer("latest", "def456"); err != nil {
-		t.Fatal(err)
-	}
-	if v, _ := s.GetPointer("latest"); v != "def456" {
-		t.Fatalf("GetPointer after overwrite = %q", v)
-	}
-	if err := s.SetPointer(strings.Repeat("a", 64), "x"); err == nil {
-		t.Fatal("pointer name shaped like a hash was accepted")
+	var free atomic.Int64
+	free.Store(1 << 30)
+	s := newStore(t, f, "", 1024, fakeDisk(&free, 1<<20))
+	stopped(t, s)
+	st := s.Stats()
+	if st.MinFree != 1<<20 || st.FreeBytes != 1<<30 {
+		t.Fatalf("stats = %+v, want the watermark and the free bytes reported back", st)
+	}
+	if st.VictimAge != 0 || st.Evictions != 0 || st.Refusals != 0 {
+		t.Fatalf("stats = %+v before any traffic, want zeroes", st)
 	}
 }
 
@@ -1109,17 +920,18 @@ func deadStore(t *testing.T) *Store {
 	t.Helper()
 	root := t.TempDir()
 	s, err := New(Config{
-		Endpoint:    "http://127.0.0.1:1",
-		Bucket:      "epochs",
-		Prefix:      "epoch/",
-		Credentials: deadCreds{},
-		SpoolDir:    filepath.Join(root, "spool"),
-		CacheDir:    filepath.Join(root, "cache"),
-		CacheBytes:  1 << 20,
+		Endpoint:     "http://127.0.0.1:1",
+		Bucket:       "epochs",
+		Prefix:       "epoch/",
+		Credentials:  deadCreds{},
+		SpoolDir:     filepath.Join(root, "spool"),
+		CacheDir:     filepath.Join(root, "cache"),
+		CacheMinFree: 1,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { s.Close() })
 	return s
 }
 
@@ -1145,7 +957,6 @@ func TestPointersAreLocalFirst(t *testing.T) {
 	}
 
 	s2 := reopen(t, s)
-	defer s2.Close()
 	if v, err := s2.GetPointer("latest"); err != nil || v != "epoch def\n" {
 		t.Fatalf("after reopen GetPointer = %q, %v", v, err)
 	}
@@ -1170,7 +981,7 @@ func TestPointersAreLocalFirst(t *testing.T) {
 // content is there, and not at all while some artifact is still failing.
 func TestSyncUploadsContentBeforePointers(t *testing.T) {
 	f := newFakeS3(t)
-	s := newStore(t, f, "epoch/", 1024, 1<<20)
+	s := newStore(t, f, "epoch/", 1024)
 
 	var hashes []string
 	for i := 0; i < 3; i++ {
@@ -1230,7 +1041,7 @@ func TestSyncUploadsContentBeforePointers(t *testing.T) {
 // read is an error, never a guess.
 func TestGetPointerFallsBackToBucket(t *testing.T) {
 	f := newFakeS3(t)
-	s := newStore(t, f, "epoch/", 1024, 1<<20)
+	s := newStore(t, f, "epoch/", 1024)
 	f.mu.Lock()
 	f.objects["epoch/latest"] = []byte("epoch 1234\n")
 	f.mu.Unlock()
@@ -1245,7 +1056,6 @@ func TestGetPointerFallsBackToBucket(t *testing.T) {
 	// The same read on a store that cannot reach the bucket bubbles the real
 	// failure rather than inventing an answer.
 	dead := deadStore(t)
-	defer dead.Close()
 	_, err := dead.GetPointer("latest")
 	if err == nil || !strings.Contains(err.Error(), "InvalidGrantException") {
 		t.Fatalf("unreadable bucket pointer err=%v, want the credential failure", err)
@@ -1254,7 +1064,7 @@ func TestGetPointerFallsBackToBucket(t *testing.T) {
 
 func TestSyncIsIdempotent(t *testing.T) {
 	f := newFakeS3(t)
-	s := newStore(t, f, "", 1024, 1<<20)
+	s := newStore(t, f, "", 1024)
 	data := randBytes(3000, 7)
 	hash := hashOf(data)
 	spool(t, s, hash, data)
@@ -1269,7 +1079,7 @@ func TestSyncIsIdempotent(t *testing.T) {
 	}
 
 	// A second store, so no in-memory state can be doing the work.
-	s2 := newStore(t, f, "", 1024, 1<<20)
+	s2 := newStore(t, f, "", 1024)
 	spool(t, s2, hash, data)
 	if done := mustSync(t, s2); len(done) != 1 || done[0] != hash {
 		t.Fatalf("Sync confirmed %v, want [%s]", done, hash)
@@ -1279,12 +1089,62 @@ func TestSyncIsIdempotent(t *testing.T) {
 	}
 
 	// Release works off a HEAD alone, with no Sync in this process.
-	s3 := newStore(t, f, "", 1024, 1<<20)
+	s3 := newStore(t, f, "", 1024)
 	spool(t, s3, hash, data)
 	if err := s3.Release(hash); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(s3.SpoolPath(hash)); !errors.Is(err, fs.ErrNotExist) {
 		t.Fatalf("Release left the spool file behind: %v", err)
+	}
+}
+
+// TestValidChunkName is the name rule the whole layout rests on: a chunk is a
+// hash, a dot and an index, and nothing else in the tree is ever mistaken for
+// one.
+func TestValidChunkName(t *testing.T) {
+	h := strings.Repeat("a", 64)
+	for _, ok := range []string{h + ".0", h + ".17", h + ".999999"} {
+		if !validChunkName(ok) {
+			t.Fatalf("%s was rejected", ok)
+		}
+	}
+	for _, bad := range []string{h, h + ".", "." + h, h + ".0.1.tmp", h + ".0.tmp",
+		h[:63] + ".0", strings.Repeat("g", 64) + ".0", h + ".x", ".clean", ""} {
+		if validChunkName(bad) {
+			t.Fatalf("%s was accepted", bad)
+		}
+	}
+	// A generated tmp name is never a chunk name, whatever CreateTemp picks.
+	f, err := os.CreateTemp(t.TempDir(), chunkName(h, 3)+".*.tmp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if validChunkName(filepath.Base(f.Name())) {
+		t.Fatalf("%s was accepted as a chunk", filepath.Base(f.Name()))
+	}
+}
+
+// TestWindowIsUTCTwentyMinutes pins the bucket arithmetic: integer
+// unix_minutes/20, never local time.
+func TestWindowIsUTCTwentyMinutes(t *testing.T) {
+	base := time.Date(2026, 8, 3, 12, 0, 0, 0, time.UTC)
+	if window(base) != window(base.Add(19*time.Minute)) {
+		t.Fatal("19 minutes crossed a window")
+	}
+	if window(base)+1 != window(base.Add(20*time.Minute)) {
+		t.Fatal("20 minutes did not advance the window by one")
+	}
+	// Same instant, different clock: same window.
+	tokyo, err := time.LoadLocation("Asia/Tokyo")
+	if err != nil {
+		t.Skip("no tzdata")
+	}
+	if window(base) != window(base.In(tokyo)) {
+		t.Fatal("the window depended on the location of the clock")
+	}
+	if got := window(time.Unix(1200*1234, 0)); got != 1234 {
+		t.Fatalf("window = %d, want 1234", got)
 	}
 }
