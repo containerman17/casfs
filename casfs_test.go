@@ -35,6 +35,7 @@ func newStore(t *testing.T, f *fakeS3, prefix string, chunkSize int64, opts ...f
 		SecretKey:    "minioadmin",
 		SpoolDir:     filepath.Join(root, "spool"),
 		CacheDir:     filepath.Join(root, "cache"),
+		Namespace:    "chainA",
 		ChunkSize:    chunkSize,
 		CacheMinFree: 1,
 	}
@@ -152,13 +153,17 @@ func mustSync(t *testing.T, s *Store) []string {
 	return done
 }
 
-// cachedNames is every file in the window tree, mapped to the window it sits in.
-func cachedNames(t *testing.T, s *Store) map[string]int64 {
+// cachedNames is every file in this store's part of the window tree, mapped to
+// the window it sits in.
+func cachedNames(t *testing.T, s *Store) map[string]string {
 	t.Helper()
-	out := map[string]int64{}
+	out := map[string]string{}
 	for _, w := range s.windows() {
-		ents, err := os.ReadDir(s.windowDir(w))
+		ents, err := os.ReadDir(s.chunkDir(w))
 		if err != nil {
+			if errors.Is(err, fs.ErrNotExist) {
+				continue
+			}
 			t.Fatal(err)
 		}
 		for _, e := range ents {
@@ -168,14 +173,24 @@ func cachedNames(t *testing.T, s *Store) map[string]int64 {
 	return out
 }
 
-// plant puts a file straight into a chosen window, which is how a test makes
-// the cache look old without waiting twenty minutes.
-func plant(t *testing.T, s *Store, w int64, name string, data []byte) {
+// winBack is the window n buckets before the current one, which is how a test
+// makes the cache look old without waiting twenty minutes.
+func winBack(n int) string {
+	return windowName(time.Now().Add(-time.Duration(n) * windowMinutes * time.Minute))
+}
+
+// plant puts a file straight into a chosen window, under an owner (empty means
+// this store's own).
+func plant(t *testing.T, s *Store, w, ns, name string, data []byte) {
 	t.Helper()
-	if err := os.MkdirAll(s.windowDir(w), 0o755); err != nil {
+	if ns == "" {
+		ns = s.cfg.Namespace
+	}
+	dir := filepath.Join(s.windowDir(w), ns)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(s.windowDir(w), name), data, 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, name), data, 0o644); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -223,7 +238,7 @@ func TestFillAndReadRoundTrip(t *testing.T) {
 	}
 
 	names := cachedNames(t, s)
-	cur := nowWindow()
+	cur := curWindow()
 	for i := int64(0); i < nchunks(int64(len(data)), 4096); i++ {
 		name := chunkName(hash, i)
 		w, ok := names[name]
@@ -231,7 +246,7 @@ func TestFillAndReadRoundTrip(t *testing.T) {
 			t.Fatalf("chunk %s was not cached", name)
 		}
 		if w != cur {
-			t.Fatalf("chunk %s landed in window %d, want the current one %d", name, w, cur)
+			t.Fatalf("chunk %s landed in window %s, want the current one %s", name, w, cur)
 		}
 	}
 }
@@ -382,54 +397,75 @@ func TestAdmissionRefusesOverWatermark(t *testing.T) {
 	}
 }
 
-// TestWorkerDrainsOldestFirstAndStopsAtCurrent is the eviction contract: the
-// oldest non-current window goes first, whole, and when only the current
+// TestWorkerDropsWholeWindowsOldestFirst is the eviction contract: the oldest
+// window goes ENTIRELY, in one rm -r, oldest first, and when only the current
 // window is left the worker STOPS. A saturated cache freezes full rather than
 // eating its own fresh fills, which is what admission control is there for.
-func TestWorkerDrainsOldestFirstAndStopsAtCurrent(t *testing.T) {
+//
+// A whole window is the unit because the names sort chronologically, so the
+// first entry of a sorted readdir IS the oldest cohort: no victim selection,
+// no cursor, no scan. Every owner sharing that window goes with it.
+func TestWorkerDropsWholeWindowsOldestFirst(t *testing.T) {
 	f := newFakeS3(t)
 	var free atomic.Int64
 	free.Store(0) // permanently over the watermark
 	s := newStore(t, f, "", 1024, fakeDisk(&free, 1<<20))
 	stopped(t, s)
 
-	cur := nowWindow()
+	cur := curWindow()
+	old, mid := winBack(5), winBack(2)
 	h := strings.Repeat("a", 64)
-	for i, w := range []int64{cur - 5, cur - 2, cur} {
+	for i, w := range []string{old, mid, cur} {
 		for j := 0; j < 3; j++ {
-			plant(t, s, w, chunkName(h, int64(i*10+j)), []byte("x"))
+			plant(t, s, w, "", chunkName(h, int64(i*10+j)), []byte("x"))
 		}
+		// A second owner in the same window, to prove a drop is per COHORT and
+		// not per owner.
+		plant(t, s, w, "chainB", chunkName(h, int64(i*10+9)), []byte("y"))
+	}
+	// Rebuild the map by hand rather than reopening: a fresh store would start
+	// its own worker, and over this watermark it would evict before the test
+	// could look.
+	s2 := s
+	if err := s2.scanCache(); err != nil {
+		t.Fatal(err)
 	}
 
-	for i := 0; i < 6; i++ {
-		if !s.evictOne() {
-			t.Fatalf("worker stopped after %d deletes, want 6", i)
-		}
-		if i < 3 && len(cachedNames(t, s)) != 9-i-1 {
-			t.Fatalf("delete %d did not remove exactly one file", i)
-		}
+	if !s2.evictOldest() {
+		t.Fatal("the worker found nothing to drop")
 	}
-	if s.evictOne() {
-		t.Fatal("worker deleted from the current window")
+	if got := s2.windows(); len(got) != 2 || got[0] != mid {
+		t.Fatalf("windows after one drop = %v, want [%s %s]", got, mid, cur)
 	}
-	left := cachedNames(t, s)
-	if len(left) != 3 {
-		t.Fatalf("%d files left, want the current window's 3: %v", len(left), left)
+	if _, err := os.Stat(s2.windowDir(old)); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("the oldest window survived its drop: %v", err)
 	}
-	for name, w := range left {
-		if w != cur {
-			t.Fatalf("%s survived in window %d, want only the current one", name, w)
-		}
+	if len(cachedNames(t, s2)) != 6 {
+		t.Fatalf("%d files left, want 6", len(cachedNames(t, s2)))
 	}
-	// The drained windows are gone, not left as empty directories.
-	for _, w := range s.windows() {
-		if w != cur {
-			t.Fatalf("window %d was drained but not removed", w)
-		}
+	s2.mu.Lock()
+	mapped := len(s2.where)
+	s2.mu.Unlock()
+	if mapped != 6 {
+		t.Fatalf("the map still holds %d chunks, want 6", mapped)
 	}
-	// The horizon is the age of what it actually deleted, not a setting.
-	if st := s.Stats(); st.Evictions != 6 || st.VictimAge != 2*windowMinutes*time.Minute {
-		t.Fatalf("stats = %+v, want 6 evictions and a 40m victim age", st)
+
+	if !s2.evictOldest() {
+		t.Fatal("the worker stopped with a non-current window still there")
+	}
+	if s2.evictOldest() {
+		t.Fatal("the worker dropped the current window")
+	}
+	if got := s2.windows(); len(got) != 1 || got[0] != cur {
+		t.Fatalf("windows = %v, want only the current one", got)
+	}
+	// The horizon is the age of what it actually dropped, not a setting.
+	st := s2.Stats()
+	if st.Evictions != 2 {
+		t.Fatalf("evictions = %d, want 2 windows", st.Evictions)
+	}
+	if st.VictimAge < 40*time.Minute || st.VictimAge > 70*time.Minute {
+		t.Fatalf("victim age = %v, want about 40m", st.VictimAge)
 	}
 }
 
@@ -442,10 +478,9 @@ func TestPromoteOnTouchFromAnyOlderWindow(t *testing.T) {
 	data := randBytes(1024*2, 5)
 	hash := f.seed("", data)
 
-	cur := nowWindow()
 	// One chunk one window back, one chunk a day back: both must move.
-	plant(t, s, cur-1, chunkName(hash, 0), data[:1024])
-	plant(t, s, cur-72, chunkName(hash, 1), data[1024:])
+	plant(t, s, winBack(1), "", chunkName(hash, 0), data[:1024])
+	plant(t, s, winBack(72), "", chunkName(hash, 1), data[1024:])
 	s2 := reopen(t, s)
 
 	file, err := s2.Open(hash)
@@ -458,15 +493,15 @@ func TestPromoteOnTouchFromAnyOlderWindow(t *testing.T) {
 		t.Fatal("promoted read differed")
 	}
 	for name, w := range cachedNames(t, s2) {
-		if w != nowWindow() {
-			t.Fatalf("%s stayed in window %d after a read, want %d", name, w, nowWindow())
+		if w != curWindow() {
+			t.Fatalf("%s stayed in window %s after a read, want %s", name, w, curWindow())
 		}
 	}
 	s2.mu.Lock()
 	defer s2.mu.Unlock()
 	for name, w := range s2.where {
-		if w != nowWindow() {
-			t.Fatalf("map still says %s is in window %d", name, w)
+		if w != curWindow() {
+			t.Fatalf("map still says %s is in window %s", name, w)
 		}
 	}
 }
@@ -525,10 +560,9 @@ func TestWholeWindowExpiresByAge(t *testing.T) {
 	s := newStore(t, f, "", 1024, func(c *Config) { c.CacheMaxAge = time.Hour })
 	stopped(t, s)
 
-	cur := nowWindow()
 	h := strings.Repeat("b", 64)
-	plant(t, s, cur-10, chunkName(h, 0), []byte("old")) // 200 minutes back
-	plant(t, s, cur-1, chunkName(h, 1), []byte("new"))
+	plant(t, s, winBack(10), "", chunkName(h, 0), []byte("old")) // 200 minutes back
+	plant(t, s, winBack(1), "", chunkName(h, 1), []byte("new"))
 	s2 := reopen(t, s)
 	stopped(t, s2)
 
@@ -556,14 +590,14 @@ func TestStrayTmpIsCollected(t *testing.T) {
 	s := newStore(t, f, "", 1024)
 	stopped(t, s)
 
-	cur := nowWindow()
+	cur := curWindow()
 	h := strings.Repeat("c", 64)
 	fresh := chunkName(h, 0) + ".111.tmp"
 	stale := chunkName(h, 1) + ".222.tmp"
-	plant(t, s, cur, fresh, []byte("half"))
-	plant(t, s, cur, stale, []byte("half"))
+	plant(t, s, cur, "", fresh, []byte("half"))
+	plant(t, s, cur, "", stale, []byte("half"))
 	old := time.Now().Add(-2 * tmpMaxAge)
-	if err := os.Chtimes(filepath.Join(s.windowDir(cur), stale), old, old); err != nil {
+	if err := os.Chtimes(filepath.Join(s.chunkDir(cur), stale), old, old); err != nil {
 		t.Fatal(err)
 	}
 
@@ -595,9 +629,8 @@ func TestTornWriteNeverBecomesAChunk(t *testing.T) {
 	data := randBytes(1024*2, 8)
 	hash := f.seed("", data)
 
-	cur := nowWindow()
 	torn := chunkName(hash, 0) + ".999.tmp"
-	plant(t, s, cur, torn, data[:100]) // the write died a tenth of the way in
+	plant(t, s, curWindow(), "", torn, data[:100]) // the write died a tenth in
 
 	s2 := reopen(t, s)
 	if _, ok := cachedNames(t, s2)[chunkName(hash, 0)]; ok {
@@ -613,9 +646,10 @@ func TestTornWriteNeverBecomesAChunk(t *testing.T) {
 	}
 }
 
-// TestReadsTolerateChunksVanishing is ENOENT tolerance end to end: a sibling
-// process (here, a goroutine) deleting the whole cache under live readers
-// costs refetches and nothing else. Every answer stays byte-correct.
+// TestReadsTolerateChunksVanishing is ENOENT tolerance end to end, exercised
+// the way the worker actually evicts: whole windows disappear from under live
+// readers, which costs refetches and nothing else. Every answer stays
+// byte-correct.
 func TestReadsTolerateChunksVanishing(t *testing.T) {
 	f := newFakeS3(t)
 	s := newStore(t, f, "", 4096)
@@ -634,7 +668,7 @@ func TestReadsTolerateChunksVanishing(t *testing.T) {
 			default:
 			}
 			for _, w := range s.windows() {
-				os.RemoveAll(s.windowDir(w))
+				os.RemoveAll(s.windowDir(w)) // a cohort drop, the real operation
 			}
 			time.Sleep(time.Millisecond)
 		}
@@ -1126,25 +1160,96 @@ func TestValidChunkName(t *testing.T) {
 	}
 }
 
-// TestWindowIsUTCTwentyMinutes pins the bucket arithmetic: integer
-// unix_minutes/20, never local time.
-func TestWindowIsUTCTwentyMinutes(t *testing.T) {
+// TestWindowNamesSortChronologically is the pin the whole layout rests on: the
+// names are fixed-width UTC bucket starts, so ALPHABETICAL ORDER IS
+// CHRONOLOGICAL ORDER, which is what lets eviction be "rm -r the first
+// directory". A name must also parse back to exactly the instant it came from.
+func TestWindowNamesSortChronologically(t *testing.T) {
 	base := time.Date(2026, 8, 3, 12, 0, 0, 0, time.UTC)
-	if window(base) != window(base.Add(19*time.Minute)) {
+	if got := windowName(base.Add(47 * time.Minute)); got != "2026-08-03T12-40" {
+		t.Fatalf("windowName = %q, want 2026-08-03T12-40", got)
+	}
+	if windowName(base) != windowName(base.Add(19*time.Minute)) {
 		t.Fatal("19 minutes crossed a window")
 	}
-	if window(base)+1 != window(base.Add(20*time.Minute)) {
-		t.Fatal("20 minutes did not advance the window by one")
+	if windowName(base) == windowName(base.Add(20*time.Minute)) {
+		t.Fatal("20 minutes did not advance the window")
 	}
-	// Same instant, different clock: same window.
-	tokyo, err := time.LoadLocation("Asia/Tokyo")
+
+	// Increasing times must produce increasing names, across every boundary
+	// that could break a fixed-width format: minute, hour, day, month, year.
+	var prev string
+	for _, at := range []time.Time{
+		time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
+		time.Date(2026, 1, 1, 0, 20, 0, 0, time.UTC),
+		time.Date(2026, 1, 1, 0, 40, 0, 0, time.UTC),
+		time.Date(2026, 1, 1, 1, 0, 0, 0, time.UTC),
+		time.Date(2026, 1, 1, 9, 40, 0, 0, time.UTC),
+		time.Date(2026, 1, 1, 10, 0, 0, 0, time.UTC),
+		time.Date(2026, 1, 1, 23, 40, 0, 0, time.UTC),
+		time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC),
+		time.Date(2026, 1, 9, 0, 0, 0, 0, time.UTC),
+		time.Date(2026, 1, 10, 0, 0, 0, 0, time.UTC),
+		time.Date(2026, 1, 31, 23, 40, 0, 0, time.UTC),
+		time.Date(2026, 2, 1, 0, 0, 0, 0, time.UTC),
+		time.Date(2026, 9, 30, 23, 40, 0, 0, time.UTC),
+		time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC),
+		time.Date(2026, 12, 31, 23, 40, 0, 0, time.UTC),
+		time.Date(2027, 1, 1, 0, 0, 0, 0, time.UTC),
+	} {
+		name := windowName(at)
+		if name <= prev {
+			t.Fatalf("%s does not sort after %s, so chronological order is not alphabetical order", name, prev)
+		}
+		got, ok := windowAt(name)
+		if !ok || !got.Equal(at) {
+			t.Fatalf("windowAt(%s) = %v, %v, want %v", name, got, ok, at)
+		}
+		prev = name
+	}
+	// And ReadDir's own sort has to agree, since that is what the worker uses.
+	dir := t.TempDir()
+	names := []string{"2026-10-01T00-00", "2026-02-01T00-00", "2027-01-01T00-00", "2026-01-01T00-20"}
+	for _, n := range names {
+		if err := os.MkdirAll(filepath.Join(dir, n), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ents, err := os.ReadDir(dir)
 	if err != nil {
-		t.Skip("no tzdata")
+		t.Fatal(err)
 	}
-	if window(base) != window(base.In(tokyo)) {
-		t.Fatal("the window depended on the location of the clock")
+	want := []string{"2026-01-01T00-20", "2026-02-01T00-00", "2026-10-01T00-00", "2027-01-01T00-00"}
+	for i, e := range ents {
+		if e.Name() != want[i] {
+			t.Fatalf("ReadDir order %d = %s, want %s", i, e.Name(), want[i])
+		}
 	}
-	if got := window(time.Unix(1200*1234, 0)); got != 1234 {
-		t.Fatalf("window = %d, want 1234", got)
+
+	// Anything that does not round-trip is not one of ours, which is the whole
+	// rejection rule: a minute field off the grid, a stray, a legacy layout.
+	for _, bad := range []string{"2026-08-03T12-41", "2026-08-03T12", "2026-08-03",
+		"1786132800", "ab", ".clean", "", "2026-13-03T12-00"} {
+		if _, ok := windowAt(bad); ok {
+			t.Fatalf("%q was accepted as a window", bad)
+		}
+	}
+}
+
+// TestNamespaceMustBeOnePathElement: the namespace names a directory this
+// store creates and deletes inside, and epochdb feeds it a data directory's
+// name, so it may never be a path that walks out of the cache root.
+func TestNamespaceMustBeOnePathElement(t *testing.T) {
+	f := newFakeS3(t)
+	root := t.TempDir()
+	for _, bad := range []string{"..", ".", "a/b", "/abs", "a/"} {
+		_, err := New(Config{
+			Endpoint: f.URL, Bucket: f.bucket, AccessKey: "a", SecretKey: "b",
+			SpoolDir: filepath.Join(root, "spool"), CacheDir: filepath.Join(root, "cache"),
+			Namespace: bad, CacheMinFree: 1,
+		})
+		if err == nil {
+			t.Fatalf("namespace %q was accepted", bad)
+		}
 	}
 }

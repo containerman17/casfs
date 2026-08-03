@@ -8,9 +8,10 @@ object key (optionally behind a configured prefix). Uploads are therefore
 idempotent, and two writers racing on the same content write identical bytes,
 so there is nothing to coordinate.
 
-Locally, an object is cached as **plain 4MB chunk files in a shared directory
-of time windows**. Reads are `open`+`pread`; a consumer that genuinely needs a
-range for the life of its process can map it, one mapping per chunk.
+Locally, an object is cached as **plain 4MB chunk files under
+`<window>/<owner>/`**, where the window is a 20-minute UTC time bucket. Reads
+are `open`+`pread`; a consumer that genuinely needs a range for the life of its
+process can map it, one mapping per chunk.
 
 Zero dependencies outside the standard library, apart from AWS credential
 resolution. Linux only: the cache uses `statfs` and `mmap` with no fallback.
@@ -71,6 +72,7 @@ s, err := casfs.New(casfs.Config{
     SecretKey: "...",
     SpoolDir:  "/var/lib/app/spool",
     CacheDir:  "/var/lib/app/cache",
+    Namespace: "2oYMBNV4...FByM", // this store's owner inside the cache tree
     ChunkSize: 4 << 20,   // default
 
     // Admission watermark, in absolute bytes of free space. 0 means 5% of the
@@ -139,10 +141,10 @@ marker, and no shutdown handshake: skipping it costs nothing at all.
 ## Layout
 
 ```
-<SpoolDir>/<hash>                       durable until uploaded
-<SpoolDir>/.pointers/<name>             durable until uploaded
-<CacheDir>/<window>/<hash>.<index>      disposable, 4MB, one file per chunk
-<CacheDir>/<window>/<hash>.<index>.*.tmp   a fill in flight
+<SpoolDir>/<hash>                                   durable until uploaded
+<SpoolDir>/.pointers/<name>                         durable until uploaded
+<CacheDir>/<window>/<owner>/<hash>.<index>          disposable, 4MB per file
+<CacheDir>/<window>/<owner>/<hash>.<index>.*.tmp    a fill in flight
 ```
 
 A chunk file is named by **the artifact hash and the chunk index, not by a
@@ -152,26 +154,40 @@ looking at the file can decide who it belongs to. A content-hashed name would
 buy deduplication nobody has ever needed here and cost the ability to find a
 chunk you have not already been told the hash of.
 
-A window is `unix_minutes / 20` as an integer, in UTC, never local time. The
-window a file sits in **is** its recency, so the LRU lives in the directory
-tree rather than in anyone's memory and survives a restart with no journal.
+**The window comes first, and that ordering is the whole design.** A window is
+the UTC start of a 20-minute bucket, written `2026-08-03T12-40`: fixed width in
+every field, so **alphabetical order is chronological order**. The globally
+oldest cohort is therefore the lexicographically first directory under the
+cache root, which is what collapses eviction into `rm -r` of one directory. It
+also means an operator can `ls` the tree, read the cache horizon off the first
+entry, and hand-trim it.
 
-`New` does one **name-only walk** of the window tree to build this process's
-`chunk -> window` map (175k files in ~110ms warm on ext4). Anything at the top
-level that is not a numeric window directory is deleted, which is the entire
-migration story off the old sparse per-artifact cache. There is no
-compatibility mode: the cache is disposable, so a layout change is paid for by
-refetching.
+**The owner (`Config.Namespace`) is the level under it.** Hash filenames are
+illegible to a human, so this exists to make ownership visible: `du` per owner,
+`rm -r <CacheDir>/*/<owner>` to wipe exactly one owner's cache, and the
+one-writer-per-owner invariant enforced by the directory tree instead of by a
+convention. Several owners share one cache root and one set of windows, so they
+also share the eviction horizon, which is the point when they are chains in one
+process competing for one disk.
+
+The window a file sits in **is** its recency, so the LRU lives in the directory
+tree rather than in anyone's memory: it survives a restart with no journal, and
+several processes can share it without agreeing about anything.
+
+`New` does one **name-only walk** of its own owner directory in each window to
+build this process's `chunk -> window` map (175k files in ~112ms warm on ext4).
+Anything at the cache root that is not a window directory is deleted, which is
+the entire migration story off any older layout. There is no compatibility
+mode: the cache is disposable, so a layout change is paid for by refetching.
 
 That map is a **hint owned by one process**. An entry that is wrong because a
 sibling process evicted the file costs one `ENOENT` and a refetch, never a
-wrong answer, so no two processes have to agree about anything and several may
-share one cache directory.
+wrong answer.
 
 ## Recency: promote on touch
 
 Reading a chunk that is in **any** window older than the current one renames it
-into the current one. That is at most one rename per chunk per window, and it
+into `<current window>/<owner>/`, creating the directory on demand. That is at most one rename per chunk per window, and it
 is deliberately greedy: promoting only when a chunk is two or more windows
 behind stops distinguishing hot from cold exactly when it matters, because
 under pressure everything the worker is about to eat looks equally stale, and
@@ -198,37 +214,40 @@ the filesystem: what matters to everything else on the box is how much room is
 left, not what share of it casfs took. The default is 5% of the filesystem free,
 i.e. cache up to 95% full.
 
-## Eviction: one background worker
+## Eviction: one background worker, one `rm -r`
 
-One goroutine per store. While the disk is over the watermark it unlinks **one
-file at a time from the oldest non-current window**, in readdir order, with a
-small sleep between deletes; otherwise it idles on a long poll. The victim
-window's directory handle is cached across deletes, so a delete costs one
-`unlink` and not a readdir of a window holding a hundred thousand files. One
-delete per tick is the throttle; there is no other one.
+One goroutine per store. While the disk is over the watermark it **drops the
+oldest window entirely** and then waits a minute for `statfs` to settle before
+believing it again; otherwise it idles on a short poll. There is no victim
+selection, no cursor, and no scan: the names sort chronologically, so the first
+entry of a sorted `readdir` **is** the oldest cohort, and everything in it is at
+least one window cold by construction. Every owner sharing that window goes
+with it.
 
-**It never touches the current window.** If only the current window has files,
+**It never touches the current window.** If the current window is all there is,
 the worker stops and admission control carries the load: a saturated cache
 freezes full rather than eating the fills it just made. Churning is strictly
 worse than freezing, because every evicted-and-refetched chunk is a GET that
 bought nothing.
 
-A delete that returns `ENOENT` counts as progress: a sibling process got there
-first. A window the worker drains is `rmdir`ed. Unlinking while `getdents`
-walks the same directory may skip entries, so a window that refuses to `rmdir`
-is simply revisited on the next pass.
+The accepted edge, recorded rather than hidden: a cache filled fast (a
+bootstrap, a backfill) concentrates most of its bytes in a few windows, so the
+first pressure eviction after one drops a big cohort at once. It is deliberate
+and self-correcting, it only fires when the disk is genuinely full, and
+everything it drops was already at least a window cold.
 
-Separately, and regardless of disk fill, whole window directories older than
-`CacheMaxAge` (default 30 days) are deleted **by name**, with no stat and no
-per-file work. That is safe precisely because a promotion's target is always
-the current window: nothing anyone still reads can be sitting in a directory
+Separately, and regardless of disk fill, whole windows older than
+`CacheMaxAge` (default 30 days) are dropped **by name**, with no stat and no
+per-file work: the same operation, gated on the window's own name instead of on
+the watermark. That is safe precisely because a promotion's target is always the
+current window, so nothing anyone still reads can be sitting in a directory
 named thirty days ago. Stray `*.tmp` files older than an hour are collected in
 the same pass.
 
-`Stats()` reports evictions, admission refusals, and **the age of the window
-the worker last deleted from**. That last number is the honest cache horizon:
-how long a chunk actually survives here. A byte budget could only ever have
-reported its own configuration back.
+`Stats()` reports admission refusals, the number of **windows** dropped, and
+**the age of the window the worker last dropped**. That last number is the
+honest cache horizon: how long a chunk actually survives here. A byte budget
+could only ever have reported its own configuration back.
 
 ## Views: the one place mappings are allowed
 
@@ -308,8 +327,8 @@ asserted to be renamed forward by the read that touches it. A truncated tmp is
 asserted never to become a named chunk, and the read that follows it is
 asserted to come back correct. Thirty-two goroutines racing on one cold chunk
 are asserted to cost exactly one GET, and eight readers running against a
-goroutine deleting the entire cache in a loop are asserted to return
-byte-correct answers throughout.
+goroutine dropping whole windows in a loop are asserted to return byte-correct
+answers throughout.
 
 That signed payload hash is also the real defence against a lying spool file
 name: a compliant endpoint rejects the mismatched bytes before storing them.

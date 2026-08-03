@@ -74,6 +74,15 @@ type Config struct {
 	CacheDir  string // the window tree of chunk files, created if missing
 	ChunkSize int64  // chunk granularity, default DefaultChunkSize
 
+	// Namespace is this store's OWNER inside the cache tree
+	// (<CacheDir>/<window>/<Namespace>/...). Several owners share one cache
+	// root and one set of windows; the level exists so a human can see whose
+	// chunks are whose, wipe one owner with `rm -r <CacheDir>/*/<Namespace>`,
+	// and have the one-writer-per-owner invariant enforced by the tree rather
+	// than by a convention. It must be a single path element. Default
+	// "default".
+	Namespace string
+
 	// CacheMinFree is the ADMISSION WATERMARK in absolute bytes: while statfs
 	// reports at least this much available, fills are cached; below it they
 	// are served from memory and dropped. Zero means 5% of the filesystem,
@@ -111,7 +120,7 @@ type Store struct {
 	confirmed map[string]bool
 	// where is this process's chunk -> window hint, rebuilt by one name-only
 	// walk at startup. A stale entry costs an ENOENT and a refetch.
-	where  map[string]int64
+	where  map[string]string
 	flight map[string]*flight
 
 	// ptrMu guards the pointer files and dirty together, so a SetPointer
@@ -124,18 +133,12 @@ type Store struct {
 	// drained by Sync as it uploads and releases each one.
 	dirty map[string]bool
 
-	// The victim cursor belongs to the worker goroutine alone; Close waits for
-	// it to stop before anything else may touch these.
-	vic      *os.File
-	vicWin   int64
-	vicNames []string
-
 	stop chan struct{}
 	done chan struct{}
 
 	evictions atomic.Uint64
 	refusals  atomic.Uint64
-	horizon   atomic.Int64
+	horizon   atomic.Value // string: the last window dropped
 }
 
 func New(cfg Config) (*Store, error) {
@@ -154,6 +157,17 @@ func New(cfg Config) (*Store, error) {
 	}
 	if cfg.CacheMaxAge <= 0 {
 		cfg.CacheMaxAge = DefaultMaxAge
+	}
+	if cfg.Namespace == "" {
+		cfg.Namespace = "default"
+	}
+	// It names a directory this store creates and deletes inside, so it may
+	// not be a path: a caller passing a data directory's name must not be able
+	// to walk out of the cache root with it.
+	switch clean := filepath.Clean(cfg.Namespace); {
+	case clean != cfg.Namespace, clean == ".", clean == "..", clean == string(filepath.Separator),
+		clean != filepath.Base(clean):
+		return nil, fmt.Errorf("casfs: Namespace %q is not a single path element", cfg.Namespace)
 	}
 	if cfg.free == nil {
 		cfg.free = freeBytes
@@ -200,7 +214,7 @@ func New(cfg Config) (*Store, error) {
 		},
 		sizes:     map[string]int64{},
 		confirmed: map[string]bool{},
-		where:     map[string]int64{},
+		where:     map[string]string{},
 		flight:    map[string]*flight{},
 		dirty:     map[string]bool{},
 		stop:      make(chan struct{}),
