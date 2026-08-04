@@ -339,6 +339,16 @@ func (s *Store) Sync() ([]string, error) {
 // x-amz-content-sha256, so a compliant endpoint rejects the mismatched bytes
 // before storing them; the local check turns that into a legible error and
 // covers endpoints that do not verify.
+//
+// THE DIGEST ONLY MEANS ANYTHING WHEN THE PUT SUCCEEDED (Fuji, 2026-08-04). A
+// put that dies early (expired token, dropped connection, HTTP error) consumed
+// part of the file or none of it, so the digest is over a prefix and mismatches
+// for a file that is perfectly intact. Reporting that as corruption tells an
+// operator their sealed history rotted when all that happened is a failed
+// upload, so the upload error wins and the digest is only judged after a
+// success. s3.put makes exactly one attempt and net/http cannot replay an
+// opaque body (no GetBody), so on success the hasher has seen the file once,
+// whole.
 func (s *Store) upload(hash string) error {
 	if size, err := s.s3.head(s.key(hash)); err == nil {
 		s.mu.Lock()
@@ -359,12 +369,20 @@ func (s *Store) upload(hash string) error {
 		return err
 	}
 	h := sha256.New()
-	putErr := s.s3.put(s.key(hash), io.TeeReader(f, h), fi.Size(), hash)
+	if err := s.s3.put(s.key(hash), io.TeeReader(f, h), fi.Size(), hash); err != nil {
+		return err
+	}
+	// The TeeReader reads from f, so f's offset is exactly what the request
+	// consumed. A success on a short read is the endpoint's bug, not the file's.
+	read, err := f.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return err
+	}
+	if read != fi.Size() {
+		return fmt.Errorf("casfs: upload %s: endpoint accepted the put after reading %d of %d bytes", hash, read, fi.Size())
+	}
 	if got := hex.EncodeToString(h.Sum(nil)); got != hash {
 		return fmt.Errorf("casfs: spool file %s contains content hashing to %s, refusing it", hash, got)
-	}
-	if putErr != nil {
-		return putErr
 	}
 	s.mu.Lock()
 	s.sizes[hash] = fi.Size()

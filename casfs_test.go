@@ -10,6 +10,7 @@ import (
 	"io"
 	"io/fs"
 	"math/rand"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -903,21 +904,115 @@ func TestSpoolRenameSurvivesRestart(t *testing.T) {
 	}
 }
 
-// TestSpoolNameMismatchRejected proves the name is verified against the bytes
-// as they stream, and that the endpoint refuses to store them.
+// TestSpoolNameMismatchRejected proves a compliant endpoint refuses to store
+// bytes that do not match the signed payload hash: the request itself carries
+// the check, and its rejection is the error the operator sees.
 func TestSpoolNameMismatchRejected(t *testing.T) {
 	f := newFakeS3(t)
 	s := newStore(t, f, "", 1024)
 	name := hashOf([]byte("one thing"))
 	spool(t, s, name, []byte("quite another"))
 
-	if _, err := s.Sync(); err == nil || !strings.Contains(err.Error(), "refusing it") {
-		t.Fatalf("Sync err=%v, want the name/content mismatch", err)
+	if _, err := s.Sync(); err == nil || !strings.Contains(err.Error(), "XAmzContentSHA256Mismatch") {
+		t.Fatalf("Sync err=%v, want the endpoint's payload-hash refusal", err)
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if _, ok := f.objects[name]; ok {
 		t.Fatal("mismatched bytes were stored")
+	}
+}
+
+// putTransport is a bucket that never runs. HEAD always misses, so the store
+// goes on to upload; PUT either dies after failAfter bytes, or (failAfter < 0)
+// accepts the body WITHOUT checking the signed payload hash, which is what an
+// endpoint that does not verify looks like.
+type putTransport struct{ failAfter int64 }
+
+func (t putTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	reply := func(code int, body string) *http.Response {
+		return &http.Response{
+			StatusCode: code,
+			Status:     fmt.Sprintf("%d %s", code, http.StatusText(code)),
+			Body:       io.NopCloser(strings.NewReader(body)),
+			Header:     make(http.Header),
+			Request:    r,
+		}
+	}
+	if r.Method != http.MethodPut {
+		return reply(http.StatusNotFound, "<Error><Code>NoSuchKey</Code></Error>"), nil
+	}
+	defer r.Body.Close()
+	if t.failAfter >= 0 {
+		io.CopyN(io.Discard, r.Body, t.failAfter)
+		return nil, errors.New("connection reset by peer")
+	}
+	if _, err := io.Copy(io.Discard, r.Body); err != nil {
+		return nil, err
+	}
+	return reply(http.StatusOK, ""), nil
+}
+
+// transportStore is a store whose whole bucket is one RoundTripper.
+func transportStore(t *testing.T, rt http.RoundTripper) *Store {
+	t.Helper()
+	root := t.TempDir()
+	s, err := New(Config{
+		Endpoint:     "http://bucket.invalid",
+		Bucket:       "epochs",
+		AccessKey:    "minioadmin",
+		SecretKey:    "minioadmin",
+		SpoolDir:     filepath.Join(root, "spool"),
+		CacheDir:     filepath.Join(root, "cache"),
+		CacheMinFree: 1,
+		HTTPClient:   &http.Client{Transport: rt},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { s.Close() })
+	return s
+}
+
+// TestUploadFailureIsNeverCalledCorruption is the Fuji publisher of 2026-08-04:
+// four epochs failed to upload on an expired SSO token and the operator was
+// told their sealed history hashed to something else, because the digest was
+// judged over the prefix the dead PUT had consumed. An upload that failed says
+// NOTHING about the file.
+func TestUploadFailureIsNeverCalledCorruption(t *testing.T) {
+	s := transportStore(t, putTransport{failAfter: 16})
+	data := randBytes(4000, 21)
+	hash := hashOf(data)
+	spool(t, s, hash, data)
+
+	_, err := s.Sync()
+	if err == nil {
+		t.Fatal("Sync succeeded against an endpoint that drops every PUT")
+	}
+	if !strings.Contains(err.Error(), "connection reset") {
+		t.Fatalf("Sync err=%v, want the upload failure named", err)
+	}
+	if strings.Contains(err.Error(), "hashing to") || strings.Contains(err.Error(), "refusing it") {
+		t.Fatalf("a failed upload was reported as corrupt content: %v", err)
+	}
+	// And the file it accused is exactly what it always was.
+	got, err := os.ReadFile(s.SpoolPath(hash))
+	if err != nil || hashOf(got) != hash {
+		t.Fatalf("spool file changed under a failed upload: %v", err)
+	}
+}
+
+// TestSpoolNameLieCaughtOnASuccessfulPut is the other half: once the put
+// SUCCEEDED, the digest covers the whole file, so a mismatch really is a file
+// lying about its name. This is the endpoint that does not verify the payload
+// hash itself, which is the only reason the local check exists.
+func TestSpoolNameLieCaughtOnASuccessfulPut(t *testing.T) {
+	s := transportStore(t, putTransport{failAfter: -1})
+	name := hashOf([]byte("one thing"))
+	spool(t, s, name, []byte("quite another"))
+
+	if _, err := s.Sync(); err == nil || !strings.Contains(err.Error(), "refusing it") {
+		t.Fatalf("Sync err=%v, want the name/content mismatch", err)
 	}
 }
 

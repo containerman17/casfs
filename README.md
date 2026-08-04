@@ -333,4 +333,7 @@ answers throughout.
 That signed payload hash is also the real defence against a lying spool file
 name: a compliant endpoint rejects the mismatched bytes before storing them.
 The local streaming digest turns that into a legible error and covers endpoints
-that do not verify.
+that do not verify. It is judged ONLY after the PUT succeeded: a PUT that died
+early consumed a prefix of the file, or none of it, so its digest mismatches for
+a file that is perfectly intact. The upload error wins, and an operator never
+hears "corrupt" about content that is fine.
