@@ -1,6 +1,7 @@
 package casfs
 
 import (
+	"bytes"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
@@ -208,6 +209,129 @@ func (c *s3) put(key string, body io.Reader, size int64, payloadHash string) err
 	io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
 	resp.Body.Close()
 	return nil
+}
+
+// A single PUT tops out at 5 GiB of object, which a big epoch passes, so
+// anything larger goes up in parts. Vars, not consts, so a test can cross the
+// threshold with kilobytes instead of gigabytes.
+var (
+	multipartThreshold int64 = 5 << 30
+	partSize           int64 = 128 << 20
+)
+
+// putMultipart uploads size bytes from body as a multipart upload: initiate,
+// one PUT per part, complete. Each part is buffered whole because SigV4 commits
+// to its sha256 in the signature before the body goes out, so peak memory is
+// one partSize regardless of the object. Parts are sequential: the bottleneck
+// here is a home uplink, not S3.
+func (c *s3) putMultipart(key string, body io.Reader, size int64) error {
+	u, err := c.urlFor(key)
+	if err != nil {
+		return err
+	}
+	// send performs one signed request whose body is fully in memory. RawQuery
+	// comes from url.Values.Encode, i.e. sorted and encoded, which is exactly
+	// the canonical query string sign() commits to verbatim.
+	send := func(method string, q url.Values, payload []byte) (http.Header, []byte, error) {
+		ru := *u
+		ru.RawQuery = q.Encode()
+		req, err := http.NewRequest(method, ru.String(), bytes.NewReader(payload))
+		if err != nil {
+			return nil, nil, err
+		}
+		req.ContentLength = int64(len(payload))
+		sum := sha256.Sum256(payload)
+		if err := c.sign(req, hex.EncodeToString(sum[:]), time.Now()); err != nil {
+			return nil, nil, err
+		}
+		resp, err := c.http.Do(req)
+		if err != nil {
+			return nil, nil, fmt.Errorf("casfs: %s %s: %w", method, key, err)
+		}
+		if resp.StatusCode/100 != 2 {
+			return nil, nil, httpErr(method+" "+key, resp)
+		}
+		out, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		resp.Body.Close()
+		return resp.Header, out, err
+	}
+
+	_, out, err := send(http.MethodPost, url.Values{"uploads": {""}}, nil)
+	if err != nil {
+		return err
+	}
+	var initiated struct {
+		UploadID string `xml:"UploadId"`
+	}
+	if err := xml.Unmarshal(out, &initiated); err != nil || initiated.UploadID == "" {
+		return fmt.Errorf("casfs: multipart %s: no upload id in %q", key, out)
+	}
+	// Anything that goes wrong from here leaves parts behind, which a bucket
+	// keeps charging for until a lifecycle rule notices. Abort on the way out,
+	// best effort, and return the error that actually happened.
+	fail := func(err error) error {
+		send(http.MethodDelete, url.Values{"uploadId": {initiated.UploadID}}, nil)
+		return err
+	}
+
+	var parts []completedPart
+	buf := make([]byte, partSize)
+	for remaining := size; remaining > 0; {
+		n := min(partSize, remaining)
+		num := len(parts) + 1
+		if _, err := io.ReadFull(body, buf[:n]); err != nil {
+			return fail(fmt.Errorf("casfs: multipart %s: read part %d: %w", key, num, err))
+		}
+		h, _, err := send(http.MethodPut, url.Values{
+			"partNumber": {strconv.Itoa(num)},
+			"uploadId":   {initiated.UploadID},
+		}, buf[:n])
+		if err != nil {
+			return fail(err)
+		}
+		// The ETag goes back verbatim, quotes included: it is the completion's
+		// only proof that this part is the one the bucket stored.
+		etag := h.Get("ETag")
+		if etag == "" {
+			return fail(fmt.Errorf("casfs: multipart %s: part %d came back without an ETag", key, num))
+		}
+		parts = append(parts, completedPart{PartNumber: num, ETag: etag})
+		remaining -= n
+	}
+
+	body2, err := xml.Marshal(completeUpload{Parts: parts})
+	if err != nil {
+		return fail(err)
+	}
+	_, out, err = send(http.MethodPost, url.Values{"uploadId": {initiated.UploadID}}, body2)
+	if err != nil {
+		return fail(err)
+	}
+	// A COMPLETION CAN FAIL WITH 200 OK. S3 holds the connection open while it
+	// assembles the object, so the status line is already written by the time
+	// anything can go wrong and the failure arrives as an Error body instead.
+	var done struct {
+		XMLName xml.Name
+		Code    string `xml:"Code"`
+		Message string `xml:"Message"`
+	}
+	if err := xml.Unmarshal(out, &done); err != nil {
+		return fail(fmt.Errorf("casfs: multipart %s: complete: unreadable response %q", key, out))
+	}
+	if done.XMLName.Local == "Error" || done.Code != "" {
+		return fail(fmt.Errorf("casfs: multipart %s: complete: %s: %s", key, done.Code, done.Message))
+	}
+	return nil
+}
+
+type completedPart struct {
+	PartNumber int
+	ETag       string
+}
+
+type completeUpload struct {
+	XMLName xml.Name        `xml:"CompleteMultipartUpload"`
+	Parts   []completedPart `xml:"Part"`
 }
 
 func (c *s3) getAll(key string) ([]byte, error) {

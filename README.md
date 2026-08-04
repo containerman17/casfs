@@ -284,6 +284,18 @@ Hand-rolled SigV4 over `net/http`: casfs needs exactly HEAD, PUT, GET and
 ranged GET, which is about 60 lines of signing that both R2 and MinIO accept,
 versus minio-go's transitive dependency tree for the same four calls.
 
+Over 5 GiB a single PUT is refused (`EntityTooLarge`), so an artifact past that
+goes up as a multipart upload: initiate, one PUT per 128 MiB part, complete.
+Each part is buffered whole because SigV4 commits to its sha256 before the body
+goes out, so peak memory is one part regardless of the object, and parts are
+sequential because the bottleneck is the uplink. Two S3 behaviours the code
+takes seriously: `CompleteMultipartUpload` can fail with an Error body under a
+200 OK (the status line is written before the assembly happens), and anything
+that fails after initiate leaves billable parts behind, so it aborts on the way
+out and returns the original error. Since multipart signs PARTS and not the
+whole object, the endpoint cannot catch a spool file whose name lies, so that
+path verifies the digest in one pass BEFORE it initiates.
+
 The one AWS dependency is credential resolution, not S3: `aws-sdk-go-v2`'s
 `config`/`credentials` supply `Config.Credentials`, so SSO, instance roles and
 anything else the default chain knows about work, including their refresh.

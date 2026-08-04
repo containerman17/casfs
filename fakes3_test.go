@@ -3,6 +3,7 @@ package casfs
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/xml"
 	"fmt"
 	"io"
 	"net/http"
@@ -14,8 +15,10 @@ import (
 )
 
 // fakeS3 is an in-process, single-bucket S3 good enough for PUT, GET, ranged
-// GET and HEAD. It also checks that requests carry a plausible SigV4
-// Authorization header and that PUT bodies match the signed payload hash.
+// GET, HEAD and multipart upload. It also checks that requests carry a
+// plausible SigV4 Authorization header, that PUT bodies (whole objects and
+// parts alike) match the signed payload hash, and that the query string is in
+// canonical form.
 type fakeS3 struct {
 	*httptest.Server
 	bucket string
@@ -24,6 +27,11 @@ type fakeS3 struct {
 	objects map[string][]byte
 	counts  map[string]int // method -> request count
 	puts    []string       // keys stored, in the order they were stored
+	uploads map[string][][]byte
+	nextID  int
+	// failComplete answers CompleteMultipartUpload with an Error body under a
+	// 200, which is a thing S3 really does.
+	failComplete bool
 }
 
 func newFakeS3(t *testing.T) *fakeS3 {
@@ -32,6 +40,7 @@ func newFakeS3(t *testing.T) *fakeS3 {
 		bucket:  "epochs",
 		objects: map[string][]byte{},
 		counts:  map[string]int{},
+		uploads: map[string][][]byte{},
 	}
 	f.Server = httptest.NewServer(http.HandlerFunc(f.serve))
 	t.Cleanup(f.Server.Close)
@@ -64,6 +73,16 @@ func (f *fakeS3) serve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	key := r.URL.Path[len(prefix):]
+
+	// A signed request's query string must already be in canonical form, since
+	// the signature commits to RawQuery verbatim.
+	if r.URL.RawQuery != r.URL.Query().Encode() {
+		http.Error(w, "<Error><Code>SignatureDoesNotMatch</Code></Error>", http.StatusForbidden)
+		return
+	}
+	if f.serveMultipart(w, r, key) {
+		return
+	}
 
 	switch r.Method {
 	case http.MethodPut:
@@ -115,6 +134,95 @@ func (f *fakeS3) serve(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.Error(w, "<Error><Code>MethodNotAllowed</Code></Error>", http.StatusMethodNotAllowed)
 	}
+}
+
+// serveMultipart answers initiate / part / complete / abort, and reports
+// whether it handled the request at all. Parts are kept per upload id and only
+// concatenated at completion, so a half-finished upload stores nothing.
+func (f *fakeS3) serveMultipart(w http.ResponseWriter, r *http.Request, key string) bool {
+	q := r.URL.Query()
+	id := q.Get("uploadId")
+	_, initiating := q["uploads"]
+	if !initiating && id == "" {
+		return false
+	}
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "<Error><Code>IncompleteBody</Code></Error>", http.StatusBadRequest)
+		return true
+	}
+	sum := sha256.Sum256(body)
+	if got, want := hex.EncodeToString(sum[:]), r.Header.Get("X-Amz-Content-Sha256"); got != want {
+		http.Error(w, "<Error><Code>XAmzContentSHA256Mismatch</Code></Error>", http.StatusBadRequest)
+		return true
+	}
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	switch {
+	case initiating:
+		f.nextID++
+		id = fmt.Sprintf("upload-%d-%s", f.nextID, key)
+		f.uploads[id] = nil
+		fmt.Fprintf(w, "<InitiateMultipartUploadResult><UploadId>%s</UploadId></InitiateMultipartUploadResult>", id)
+
+	case r.Method == http.MethodDelete:
+		delete(f.uploads, id)
+		w.WriteHeader(http.StatusNoContent)
+
+	case r.Method == http.MethodPut:
+		n, err := strconv.Atoi(q.Get("partNumber"))
+		if err != nil || n != len(f.uploads[id])+1 {
+			// Sequential by construction here; a gap means a bug worth failing on.
+			http.Error(w, "<Error><Code>InvalidPart</Code></Error>", http.StatusBadRequest)
+			return true
+		}
+		f.uploads[id] = append(f.uploads[id], body)
+		w.Header().Set("ETag", fmt.Sprintf("%q", hex.EncodeToString(sum[:8])))
+		w.WriteHeader(http.StatusOK)
+
+	default: // complete
+		parts, ok := f.uploads[id]
+		if !ok {
+			http.Error(w, "<Error><Code>NoSuchUpload</Code></Error>", http.StatusNotFound)
+			return true
+		}
+		if f.failComplete {
+			fmt.Fprint(w, "<Error><Code>InternalError</Code><Message>we encountered an internal error</Message></Error>")
+			return true
+		}
+		var req struct {
+			Parts []struct {
+				PartNumber int
+				ETag       string
+			} `xml:"Part"`
+		}
+		if err := xml.Unmarshal(body, &req); err != nil || len(req.Parts) != len(parts) {
+			http.Error(w, "<Error><Code>InvalidPart</Code></Error>", http.StatusBadRequest)
+			return true
+		}
+		var obj []byte
+		for i, p := range req.Parts {
+			want := fmt.Sprintf("%q", hex.EncodeToString(sha256Of(parts[i])[:8]))
+			if p.PartNumber != i+1 || p.ETag != want {
+				http.Error(w, "<Error><Code>InvalidPart</Code></Error>", http.StatusBadRequest)
+				return true
+			}
+			obj = append(obj, parts[i]...)
+		}
+		delete(f.uploads, id)
+		f.objects[key] = obj
+		f.puts = append(f.puts, key)
+		// 200 with a body, which is the shape a failure would arrive in too.
+		fmt.Fprintf(w, "<CompleteMultipartUploadResult><ETag>%q</ETag></CompleteMultipartUploadResult>",
+			hex.EncodeToString(sha256Of(obj)[:8]))
+	}
+	return true
+}
+
+func sha256Of(b []byte) []byte {
+	sum := sha256.Sum256(b)
+	return sum[:]
 }
 
 func parseRange(h string, size int64) (start, end int64, ok bool) {

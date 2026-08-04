@@ -369,7 +369,31 @@ func (s *Store) upload(hash string) error {
 		return err
 	}
 	h := sha256.New()
-	if err := s.s3.put(s.key(hash), io.TeeReader(f, h), fi.Size(), hash); err != nil {
+	src := io.TeeReader(f, h)
+	// Over 5 GiB a single PUT is refused outright (EntityTooLarge), which is
+	// where a big epoch lands. Below it, the single PUT is the proven path and
+	// signs the whole-file digest, so it stays.
+	if fi.Size() > multipartThreshold {
+		// Multipart signs each PART's hash, so the endpoint never sees the
+		// whole-file digest and cannot refuse a name that lies. Check it here
+		// FIRST, or mismatched bytes would land in the bucket under a good name
+		// and the store's one integrity guarantee would be gone. One extra
+		// sequential read, against an upload that takes minutes.
+		pre := sha256.New()
+		if _, err := io.Copy(pre, f); err != nil {
+			return err
+		}
+		if got := hex.EncodeToString(pre.Sum(nil)); got != hash {
+			return fmt.Errorf("casfs: spool file %s contains content hashing to %s, refusing it", hash, got)
+		}
+		if _, err := f.Seek(0, io.SeekStart); err != nil {
+			return err
+		}
+		err = s.s3.putMultipart(s.key(hash), src, fi.Size())
+	} else {
+		err = s.s3.put(s.key(hash), src, fi.Size(), hash)
+	}
+	if err != nil {
 		return err
 	}
 	// The TeeReader reads from f, so f's offset is exactly what the request

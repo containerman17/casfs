@@ -1002,6 +1002,113 @@ func TestUploadFailureIsNeverCalledCorruption(t *testing.T) {
 	}
 }
 
+// TestMultipartRoundTripOverTheThreshold: a spool file too big for one PUT
+// (the real threshold is 5 GiB, here it is kilobytes) goes up in parts and comes
+// back byte-identical through ordinary ranged GETs. The 8.85GB Fuji epoch that
+// wedged the drain on 2026-08-04 is this case.
+func TestMultipartRoundTripOverTheThreshold(t *testing.T) {
+	defer func(th, ps int64) { multipartThreshold, partSize = th, ps }(multipartThreshold, partSize)
+	multipartThreshold, partSize = 4096, 4096
+
+	f := newFakeS3(t)
+	s := newStore(t, f, "epoch/", 1024)
+	data := randBytes(10_000, 31) // three parts, the last one short
+	hash := hashOf(data)
+	spool(t, s, hash, data)
+
+	if done := mustSync(t, s); len(done) != 1 || done[0] != hash {
+		t.Fatalf("Sync confirmed %v, want [%s]", done, hash)
+	}
+	f.mu.Lock()
+	stored := f.objects["epoch/"+hash]
+	f.mu.Unlock()
+	if !bytes.Equal(stored, data) {
+		t.Fatalf("assembled object is %d bytes, want %d", len(stored), len(data))
+	}
+	if f.count("PUT") != 3 {
+		t.Fatalf("%d part PUTs, want 3", f.count("PUT"))
+	}
+
+	// And it reads back the way any other artifact does, from the bucket only.
+	if err := s.Release(hash); err != nil {
+		t.Fatal(err)
+	}
+	file, err := s.Open(hash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	if got := readAll(t, file); !bytes.Equal(got, data) {
+		t.Fatal("post-release read of a multipart object differed")
+	}
+
+	// A file under the threshold still goes up whole: one PUT, no upload id.
+	small := randBytes(1000, 32)
+	spool(t, s, hashOf(small), small)
+	mustSync(t, s)
+	if f.count("PUT") != 4 {
+		t.Fatalf("%d PUTs after a small file, want 4 (3 parts + 1 whole)", f.count("PUT"))
+	}
+}
+
+// TestMultipartNameLieIsRefusedBeforeAnythingIsStored: multipart signs parts,
+// not the whole object, so the endpoint cannot catch a lying name for us. The
+// pre-pass must, and nothing may reach the bucket.
+func TestMultipartNameLieIsRefusedBeforeAnythingIsStored(t *testing.T) {
+	defer func(th, ps int64) { multipartThreshold, partSize = th, ps }(multipartThreshold, partSize)
+	multipartThreshold, partSize = 4096, 4096
+
+	f := newFakeS3(t)
+	s := newStore(t, f, "", 1024)
+	name := hashOf(randBytes(10_000, 34))
+	spool(t, s, name, randBytes(10_000, 35))
+
+	if _, err := s.Sync(); err == nil || !strings.Contains(err.Error(), "refusing it") {
+		t.Fatalf("Sync err=%v, want the name/content mismatch", err)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, ok := f.objects[name]; ok {
+		t.Fatal("mismatched bytes were stored under a good name")
+	}
+	if f.counts["POST"] != 0 { // holding f.mu already, so not f.count
+		t.Fatal("the upload was initiated before the name was checked")
+	}
+}
+
+// TestMultipartCompletionErrorInA200IsAFailure: S3 answers
+// CompleteMultipartUpload with 200 OK and an Error body, because the status
+// line is written before it finishes assembling the object. Believing the
+// status would report an upload that does not exist, and the caller would then
+// release the only durable copy.
+func TestMultipartCompletionErrorInA200IsAFailure(t *testing.T) {
+	defer func(th, ps int64) { multipartThreshold, partSize = th, ps }(multipartThreshold, partSize)
+	multipartThreshold, partSize = 4096, 4096
+
+	f := newFakeS3(t)
+	f.failComplete = true
+	s := newStore(t, f, "", 1024)
+	data := randBytes(10_000, 33)
+	hash := hashOf(data)
+	spool(t, s, hash, data)
+
+	done, err := s.Sync()
+	if err == nil || !strings.Contains(err.Error(), "InternalError") {
+		t.Fatalf("Sync err=%v, want the completion error", err)
+	}
+	if len(done) != 0 {
+		t.Fatalf("Sync confirmed %v after a failed completion", done)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, ok := f.objects[hash]; ok {
+		t.Fatal("a failed completion stored an object anyway")
+	}
+	if len(f.uploads) != 0 {
+		t.Fatalf("%d uploads left dangling, want the abort to have cleaned up", len(f.uploads))
+	}
+}
+
 // TestSpoolNameLieCaughtOnASuccessfulPut is the other half: once the put
 // SUCCEEDED, the digest covers the whole file, so a mismatch really is a file
 // lying about its name. This is the endpoint that does not verify the payload
