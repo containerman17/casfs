@@ -159,7 +159,11 @@ func mustSync(t *testing.T, s *Store) []string {
 func cachedNames(t *testing.T, s *Store) map[string]string {
 	t.Helper()
 	out := map[string]string{}
-	for _, w := range s.windows() {
+	ws, err := s.windows()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, w := range ws {
 		ents, err := os.ReadDir(s.chunkDir(w))
 		if err != nil {
 			if errors.Is(err, fs.ErrNotExist) {
@@ -435,7 +439,7 @@ func TestWorkerDropsWholeWindowsOldestFirst(t *testing.T) {
 	if !s2.evictOldest() {
 		t.Fatal("the worker found nothing to drop")
 	}
-	if got := s2.windows(); len(got) != 2 || got[0] != mid {
+	if got, _ := s2.windows(); len(got) != 2 || got[0] != mid {
 		t.Fatalf("windows after one drop = %v, want [%s %s]", got, mid, cur)
 	}
 	if _, err := os.Stat(s2.windowDir(old)); !errors.Is(err, fs.ErrNotExist) {
@@ -457,7 +461,7 @@ func TestWorkerDropsWholeWindowsOldestFirst(t *testing.T) {
 	if s2.evictOldest() {
 		t.Fatal("the worker dropped the current window")
 	}
-	if got := s2.windows(); len(got) != 1 || got[0] != cur {
+	if got, _ := s2.windows(); len(got) != 1 || got[0] != cur {
 		t.Fatalf("windows = %v, want only the current one", got)
 	}
 	// The horizon is the age of what it actually dropped, not a setting.
@@ -668,7 +672,8 @@ func TestReadsTolerateChunksVanishing(t *testing.T) {
 				return
 			default:
 			}
-			for _, w := range s.windows() {
+			ws, _ := s.windows()
+			for _, w := range ws {
 				os.RemoveAll(s.windowDir(w)) // a cohort drop, the real operation
 			}
 			time.Sleep(time.Millisecond)
@@ -781,7 +786,8 @@ func TestViewSpansChunksAndCopiesAtBoundary(t *testing.T) {
 	}
 	// The mapping outlives the file it came from: eviction is an unlink, and
 	// unlinking never disturbs a mapping.
-	for _, w := range s.windows() {
+	ws, _ := s.windows()
+	for _, w := range ws {
 		os.RemoveAll(s.windowDir(w))
 	}
 	if !bytes.Equal(v.Slice(0, 3000), data[500:3500]) {
@@ -1453,5 +1459,124 @@ func TestNamespaceMustBeOnePathElement(t *testing.T) {
 		if err == nil {
 			t.Fatalf("namespace %q was accepted", bad)
 		}
+	}
+}
+
+// TestRangeAnsweredFromTheWrongOffsetIsRefused is the read path's ONLY
+// integrity check. Chunk files are named <hash>.<index> and nothing hashes
+// them back, so bytes that arrive from an offset nobody asked for would be
+// admitted under a correct name and served as verified content forever. The
+// Content-Range start is the proof, and it is now compared.
+func TestRangeAnsweredFromTheWrongOffsetIsRefused(t *testing.T) {
+	f := newFakeS3(t)
+	s := newStore(t, f, "", 1024)
+	data := randBytes(1024*3, 9)
+	hash := f.seed("", data)
+	f.setRangeShift(1024) // every range answered one chunk late
+
+	file, err := s.Open(hash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	if _, err := file.ReadAt(make([]byte, 1024), 0); err == nil {
+		t.Fatal("a range answered from the wrong offset was accepted as content")
+	}
+	if n := len(cachedNames(t, s)); n != 0 {
+		t.Fatalf("%d chunks cached from a mis-answered range, want 0", n)
+	}
+
+	// The same store reads fine the moment the bucket answers honestly, so the
+	// check costs nothing on the good path.
+	f.setRangeShift(0)
+	if got := readAll(t, file); !bytes.Equal(got, data) {
+		t.Fatal("honest ranges returned the wrong bytes")
+	}
+}
+
+// TestStatfsFailureNeverEvicts: an unreadable disk is not a full one. The
+// worker used to read a statfs error as "not roomy" and drop one window per
+// settleDelay until the whole cache was gone, while Stats reported zero free
+// bytes, i.e. the one explanation that was certainly wrong.
+func TestStatfsFailureNeverEvicts(t *testing.T) {
+	f := newFakeS3(t)
+	var (
+		broken atomic.Bool
+		free   atomic.Int64
+	)
+	free.Store(1 << 30)
+	s := newStore(t, f, "", 1024, func(c *Config) {
+		c.CacheMinFree = 1 << 20
+		c.free = func(string) (int64, error) {
+			if broken.Load() {
+				return 0, errors.New("statfs: transport endpoint is not connected")
+			}
+			return free.Load(), nil
+		}
+	})
+	stopped(t, s) // drive the worker's decision by hand
+
+	data := randBytes(1024, 11)
+	plant(t, s, winBack(3), "", chunkName(hashOf(data), 0), data)
+
+	broken.Store(true)
+	if s.step() {
+		t.Fatal("a statfs failure evicted a window")
+	}
+	if n := len(cachedNames(t, s)); n != 1 {
+		t.Fatalf("%d cached files after a statfs failure, want the window untouched", n)
+	}
+	st := s.Stats()
+	if st.EvictErrors == 0 || st.LastError == "" {
+		t.Fatalf("stats = %+v, want the statfs failure counted and named", st)
+	}
+	if st.FreeBytes != -1 {
+		t.Fatalf("FreeBytes = %d on a failed statfs, want -1 rather than a fake 'disk full'", st.FreeBytes)
+	}
+
+	// A statfs that WORKS and says the disk is full still evicts: the fix is
+	// about the unknown, not about eviction.
+	broken.Store(false)
+	free.Store(0)
+	if !s.step() {
+		t.Fatal("a genuinely full disk did not evict")
+	}
+	if n := len(cachedNames(t, s)); n != 0 {
+		t.Fatalf("%d cached files after a real eviction, want 0", n)
+	}
+}
+
+// TestFillFailuresAreCounted: a cache directory that cannot be written turns
+// the node into an S3 passthrough. That is a legitimate degraded mode and it
+// used to be completely silent, Refusals included, so nothing distinguished it
+// from a healthy node.
+func TestFillFailuresAreCounted(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root writes to a mode 0500 directory anyway")
+	}
+	f := newFakeS3(t)
+	s := newStore(t, f, "", 1024)
+	stopped(t, s)
+	if err := os.Chmod(s.cfg.CacheDir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(s.cfg.CacheDir, 0o755) })
+
+	data := randBytes(1024*2, 12)
+	hash := f.seed("", data)
+	file, err := s.Open(hash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	if got := readAll(t, file); !bytes.Equal(got, data) {
+		t.Fatal("a read over an unwritable cache returned the wrong bytes")
+	}
+	st := s.Stats()
+	if st.FillErrors == 0 || st.LastError == "" {
+		t.Fatalf("stats = %+v, want the unwritable cache counted and named", st)
+	}
+	if st.Refusals != 0 {
+		t.Fatalf("Refusals = %d, want 0: the disk was not over its watermark", st.Refusals)
 	}
 }

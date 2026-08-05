@@ -171,17 +171,60 @@ func (c *s3) get(key string, off, n int64) (io.ReadCloser, int64, error) {
 	}
 	total := resp.ContentLength
 	if cr := resp.Header.Get("Content-Range"); cr != "" {
-		if i := strings.LastIndex(cr, "/"); i >= 0 {
-			if v, err := strconv.ParseInt(strings.TrimSpace(cr[i+1:]), 10, 64); err == nil {
-				total = v
-			}
+		start, size, err := contentRange(cr)
+		if err != nil {
+			resp.Body.Close()
+			return nil, 0, fmt.Errorf("casfs: get %s: %w", key, err)
 		}
+		// THE ONE CHECK THAT MAKES A CACHED CHUNK TRUSTWORTHY. Nothing on the
+		// read path hashes these bytes: they are written to <hash>.<index> and
+		// served under that name forever. A range answered from a different
+		// offset (or a prefix pointing at a different object of adequate
+		// length) would therefore become verified-looking content, so an
+		// answer that does not start where we asked is an error, not data.
+		if start != off {
+			resp.Body.Close()
+			return nil, 0, fmt.Errorf("casfs: get %s: asked for byte %d, the bucket answered from byte %d", key, off, start)
+		}
+		total = size
 	} else if resp.StatusCode == http.StatusOK && off > 0 {
 		// Server ignored the range and is streaming from byte zero.
 		resp.Body.Close()
 		return nil, 0, fmt.Errorf("casfs: get %s: server ignored Range header", key)
 	}
 	return resp.Body, total, nil
+}
+
+// contentRange parses "bytes <first>-<last>/<total>". EVERY FIELD MATTERS: the
+// first byte is the only proof the bytes coming back belong at the offset that
+// was asked for, and the total is the OBJECT's size rather than this range's
+// length. A form this does not understand is an error and never a silent
+// fallback, which is what let a mis-answered range be cached before.
+func contentRange(v string) (start, total int64, err error) {
+	fail := func() (int64, int64, error) {
+		return 0, 0, fmt.Errorf("unparsable Content-Range %q", v)
+	}
+	spec, ok := strings.CutPrefix(strings.TrimSpace(v), "bytes ")
+	if !ok {
+		return fail()
+	}
+	rng, tot, ok := strings.Cut(spec, "/")
+	if !ok {
+		return fail()
+	}
+	first, _, ok := strings.Cut(rng, "-")
+	if !ok {
+		return fail()
+	}
+	if start, err = strconv.ParseInt(strings.TrimSpace(first), 10, 64); err != nil {
+		return fail()
+	}
+	// "*" is legal HTTP for an unknown total and no S3 implementation sends it
+	// for a stored object, so it is refused rather than guessed at.
+	if total, err = strconv.ParseInt(strings.TrimSpace(tot), 10, 64); err != nil {
+		return fail()
+	}
+	return start, total, nil
 }
 
 // put uploads size bytes from body. payloadHash must be the hex sha256 of those
@@ -267,10 +310,15 @@ func (c *s3) putMultipart(key string, body io.Reader, size int64) error {
 		return fmt.Errorf("casfs: multipart %s: no upload id in %q", key, out)
 	}
 	// Anything that goes wrong from here leaves parts behind, which a bucket
-	// keeps charging for until a lifecycle rule notices. Abort on the way out,
-	// best effort, and return the error that actually happened.
+	// keeps charging for until a lifecycle rule notices. Abort on the way out
+	// and SAY WHETHER THE ABORT WORKED: nothing lists or reconciles multipart
+	// uploads, so an abort that silently failed is the difference between a
+	// clean retry and a multi-GB orphan nobody will ever hear about again.
 	fail := func(err error) error {
-		send(http.MethodDelete, url.Values{"uploadId": {initiated.UploadID}}, nil)
+		if _, _, aerr := send(http.MethodDelete, url.Values{"uploadId": {initiated.UploadID}}, nil); aerr != nil {
+			return fmt.Errorf("%w (and aborting upload %s failed, its parts are still in the bucket: %v)",
+				err, initiated.UploadID, aerr)
+		}
 		return err
 	}
 

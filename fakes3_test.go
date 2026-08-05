@@ -32,6 +32,15 @@ type fakeS3 struct {
 	// failComplete answers CompleteMultipartUpload with an Error body under a
 	// 200, which is a thing S3 really does.
 	failComplete bool
+	// rangeShift offsets every ranged answer, standing in for a bucket that
+	// hands back bytes from somewhere other than where they were asked for.
+	rangeShift int64
+}
+
+func (f *fakeS3) setRangeShift(n int64) {
+	f.mu.Lock()
+	f.rangeShift = n
+	f.mu.Unlock()
 }
 
 func newFakeS3(t *testing.T) *fakeS3 {
@@ -122,9 +131,19 @@ func (f *fakeS3) serve(w http.ResponseWriter, r *http.Request) {
 			w.Write(obj)
 			return
 		}
+		// A bucket that answers from an offset nobody asked for: a caching
+		// proxy serving a neighbouring range, or a rewritten key. It reports
+		// the range it actually sent, which is the whole point.
+		f.mu.Lock()
+		shift := f.rangeShift
+		f.mu.Unlock()
+		start, end = start+shift, end+shift
 		if start >= int64(len(obj)) {
 			http.Error(w, "<Error><Code>InvalidRange</Code></Error>", http.StatusRequestedRangeNotSatisfiable)
 			return
+		}
+		if end >= int64(len(obj)) {
+			end = int64(len(obj)) - 1
 		}
 		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(obj)))
 		w.Header().Set("Content-Length", strconv.FormatInt(end-start+1, 10))

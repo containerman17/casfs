@@ -136,9 +136,12 @@ type Store struct {
 	stop chan struct{}
 	done chan struct{}
 
-	evictions atomic.Uint64
-	refusals  atomic.Uint64
-	horizon   atomic.Value // string: the last window dropped
+	evictions   atomic.Uint64
+	refusals    atomic.Uint64
+	fillErrors  atomic.Uint64
+	evictErrors atomic.Uint64
+	lastErr     atomic.Value // string: the last cache-plane failure
+	horizon     atomic.Value // string: the last window dropped
 }
 
 func New(cfg Config) (*Store, error) {
@@ -351,6 +354,22 @@ func (s *Store) Sync() ([]string, error) {
 // whole.
 func (s *Store) upload(hash string) error {
 	if size, err := s.s3.head(s.key(hash)); err == nil {
+		// The HEAD short-circuit is what lets Release unlink the local durable
+		// copy, so it must be sure the bucket holds THIS content. head returns
+		// the size for free, and a size that differs is proof it does not (a
+		// prefix pointing into another store's key space, a truncated object
+		// from a killed multipart).
+		fi, serr := os.Stat(s.SpoolPath(hash))
+		if errors.Is(serr, fs.ErrNotExist) {
+			return nil // released underneath us; nothing left to upload
+		}
+		if serr != nil {
+			return serr
+		}
+		if fi.Size() != size {
+			return fmt.Errorf("casfs: %s is already in the bucket at %d bytes but the spool file is %d, refusing to treat it as uploaded",
+				hash, size, fi.Size())
+		}
 		s.mu.Lock()
 		s.sizes[hash] = size
 		s.mu.Unlock()
@@ -552,14 +571,30 @@ func (s *Store) pointerPath(name string) string {
 	return filepath.Join(s.cfg.SpoolDir, pointerDir, filepath.FromSlash(name))
 }
 
-// writePointer lands a value by tmp+rename, so a kill leaves either the old
-// value or the new one. Callers hold ptrMu.
+// writePointer lands a value by tmp+fsync+rename, so a kill leaves either the
+// old value or the new one. Callers hold ptrMu.
+//
+// THE FSYNC IS THE DURABILITY, not the rename. Without it power loss can leave
+// a renamed but zero-length file, and an empty pointer value is not obviously
+// invalid to a reader: epochdb decodes one as "this chain has no epochs".
 func (s *Store) writePointer(name, value string) error {
 	p := s.pointerPath(name)
 	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
 		return err
 	}
-	if err := os.WriteFile(p+".tmp", []byte(value), 0o644); err != nil {
+	f, err := os.OpenFile(p+".tmp", os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	if err != nil {
+		return err
+	}
+	_, err = f.WriteString(value)
+	if err == nil {
+		err = f.Sync()
+	}
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		os.Remove(p + ".tmp")
 		return err
 	}
 	return os.Rename(p+".tmp", p)

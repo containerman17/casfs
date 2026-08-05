@@ -34,12 +34,14 @@ package casfs
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -116,10 +118,10 @@ func validChunkName(name string) bool {
 
 // windows lists the cohorts present, in CHRONOLOGICAL ORDER, because os.ReadDir
 // sorts by name and the names were built so those are the same thing.
-func (s *Store) windows() []string {
+func (s *Store) windows() ([]string, error) {
 	ents, err := os.ReadDir(s.cfg.CacheDir)
 	if err != nil {
-		return nil
+		return nil, err
 	}
 	var out []string
 	for _, e := range ents {
@@ -127,7 +129,7 @@ func (s *Store) windows() []string {
 			out = append(out, e.Name())
 		}
 	}
-	return out
+	return out, nil
 }
 
 // scanCache rebuilds the chunk->window map with ONE NAME-ONLY WALK of this
@@ -322,21 +324,46 @@ func (s *Store) pull(hash string, size, idx int64) ([]byte, error) {
 	} else if !errors.Is(err, fs.ErrNotExist) {
 		return nil, err
 	}
-	body, _, err := s.s3.get(s.key(hash), off, n)
+	body, total, err := s.s3.get(s.key(hash), off, n)
 	if err != nil {
 		return nil, err
 	}
 	defer body.Close()
+	// The chunk layout is derived from size, so an object that is not that
+	// size is not the object these chunks were counted for. s3.get has already
+	// checked the range STARTS where it was asked to; this is the other half.
+	if total != size {
+		return nil, fmt.Errorf("casfs: chunk %d of %s: the bucket's object is %d bytes, this store expected %d",
+			idx, hash, total, size)
+	}
 	if _, err := io.ReadFull(body, b); err != nil {
 		return nil, err
 	}
 	return b, nil
 }
 
-// roomy reports whether the filesystem is under the watermark.
-func (s *Store) roomy() bool {
+// roomy reports whether the filesystem is under the watermark. THE ERROR IS
+// PART OF THE ANSWER: a statfs that failed means the disk is unknown, which is
+// not the same as full, and the two callers would otherwise read that one
+// silent false in opposite directions (admit declines to cache, safe; the
+// worker starts evicting, which empties the whole cache while a mount flaps).
+func (s *Store) roomy() (bool, error) {
 	free, err := s.cfg.free(s.cfg.CacheDir)
-	return err == nil && free >= s.cfg.CacheMinFree
+	if err != nil {
+		return false, err
+	}
+	return free >= s.cfg.CacheMinFree, nil
+}
+
+// note records a cache-plane failure that has no caller to return it to. The
+// cache degrades silently BY DESIGN (a fill that cannot land is served from
+// memory, an eviction that cannot run just leaves the disk full), so without
+// these counters a read-only cache directory, exhausted inodes or an fsync EIO
+// turn a node into an S3 passthrough forever while Stats says everything is
+// fine.
+func (s *Store) note(c *atomic.Uint64, op string, err error) {
+	c.Add(1)
+	s.lastErr.Store("casfs: " + op + ": " + err.Error())
 }
 
 // admit writes a fetched chunk into the current window. IT NEVER EVICTS TO
@@ -351,17 +378,24 @@ func (s *Store) roomy() bool {
 // silent wrong answers (a half-written bloom page answers "no" for keys that
 // are there).
 func (s *Store) admit(name string, b []byte) {
-	if !s.roomy() {
+	ok, err := s.roomy()
+	if err != nil {
+		s.note(&s.fillErrors, "statfs", err)
+		return
+	}
+	if !ok {
 		s.refusals.Add(1)
 		return
 	}
 	w := curWindow()
 	dir := s.chunkDir(w)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
+		s.note(&s.fillErrors, "mkdir "+dir, err)
 		return
 	}
 	f, err := os.CreateTemp(dir, name+".*.tmp")
 	if err != nil {
+		s.note(&s.fillErrors, "create tmp in "+dir, err)
 		return
 	}
 	tmp := f.Name()
@@ -377,6 +411,7 @@ func (s *Store) admit(name string, b []byte) {
 	}
 	if err != nil {
 		os.Remove(tmp)
+		s.note(&s.fillErrors, "fill "+name, err)
 		return
 	}
 	s.mu.Lock()
@@ -398,7 +433,7 @@ func (s *Store) worker() {
 			lastSweep = time.Now()
 		}
 		d := pollIdle
-		if !s.roomy() && s.evictOldest() {
+		if s.step() {
 			d = settleDelay
 		}
 		select {
@@ -407,6 +442,21 @@ func (s *Store) worker() {
 		case <-time.After(d):
 		}
 	}
+}
+
+// step is one worker decision, split out so a test can drive it without
+// waiting on the poll. It reports whether it dropped a window.
+//
+// A STATFS FAILURE MEANS DO NOTHING. It is not "no room": read as one, a
+// briefly flapping mount would drop one window per settleDelay until the
+// entire cache was gone, silently, while Stats claimed the disk was full.
+func (s *Store) step() bool {
+	ok, err := s.roomy()
+	if err != nil {
+		s.note(&s.evictErrors, "statfs", err)
+		return false
+	}
+	return !ok && s.evictOldest()
 }
 
 // evictOldest removes the oldest non-current window ENTIRELY and reports
@@ -420,11 +470,20 @@ func (s *Store) worker() {
 // evicted-and-refetched chunk is a GET that bought nothing.
 func (s *Store) evictOldest() bool {
 	cur := curWindow()
-	for _, w := range s.windows() { // chronological
+	ws, err := s.windows()
+	if err != nil {
+		s.note(&s.evictErrors, "read cache dir", err)
+		return false
+	}
+	for _, w := range ws { // chronological
 		if w >= cur {
 			return false // only current or newer left: stop
 		}
 		if err := os.RemoveAll(s.windowDir(w)); err != nil {
+			// The worker reads false as "nothing left to evict" and goes back
+			// to polling every pollIdle, so this counter is the only thing
+			// between a cache that cannot free anything and total silence.
+			s.note(&s.evictErrors, "evict window "+w, err)
 			return false
 		}
 		s.evictions.Add(1)
@@ -447,9 +506,17 @@ func (s *Store) sweep() {
 	// A tmp can only ever have been created in the window that was current at
 	// the time, so an hour of windows plus one is the whole search space.
 	fresh := windowName(time.Now().Add(-tmpMaxAge - windowMinutes*time.Minute))
-	for _, w := range s.windows() {
+	ws, err := s.windows()
+	if err != nil {
+		s.note(&s.evictErrors, "read cache dir", err)
+		return
+	}
+	for _, w := range ws {
 		if w < cutoff {
-			os.RemoveAll(s.windowDir(w))
+			if err := os.RemoveAll(s.windowDir(w)); err != nil {
+				s.note(&s.evictErrors, "expire window "+w, err)
+				continue
+			}
 			s.forgetWindow(w)
 			continue
 		}
@@ -483,24 +550,40 @@ func (s *Store) collectTmp(w string) {
 // how long a chunk survives here in practice. A byte budget could only have
 // reported its own configuration back.
 type Stats struct {
-	Evictions uint64        // WINDOWS dropped by the worker since start, not files
-	Refusals  uint64        // fills not cached because the disk was over the watermark
-	VictimAge time.Duration // age of the last window dropped, 0 if none yet
-	FreeBytes int64         // what statfs says now
-	MinFree   int64         // the watermark, in the same units
+	Evictions uint64 // WINDOWS dropped by the worker since start, not files
+	Refusals  uint64 // fills not cached because the disk was over the watermark
+	// FillErrors is fills that failed for a reason that is NOT the watermark:
+	// a read-only cache directory, no inodes, an fsync EIO. A node with a
+	// climbing count here is an S3 passthrough and nothing else says so.
+	FillErrors uint64
+	// EvictErrors is the worker failing to measure or free space.
+	EvictErrors uint64
+	LastError   string        // most recent of either, "" if none
+	VictimAge   time.Duration // age of the last window dropped, 0 if none yet
+	// FreeBytes is what statfs says now, and -1 WHEN STATFS ITSELF FAILED:
+	// zero would read as "disk full", the one explanation that is certainly
+	// wrong when the question could not be asked.
+	FreeBytes int64
+	MinFree   int64 // the watermark, in the same units
 }
 
 func (s *Store) Stats() Stats {
 	st := Stats{
-		Evictions: s.evictions.Load(),
-		Refusals:  s.refusals.Load(),
-		MinFree:   s.cfg.CacheMinFree,
+		Evictions:   s.evictions.Load(),
+		Refusals:    s.refusals.Load(),
+		FillErrors:  s.fillErrors.Load(),
+		EvictErrors: s.evictErrors.Load(),
+		MinFree:     s.cfg.CacheMinFree,
 	}
+	st.LastError, _ = s.lastErr.Load().(string)
 	if w, _ := s.horizon.Load().(string); w != "" {
 		if t, ok := windowAt(w); ok {
 			st.VictimAge = time.Since(t)
 		}
 	}
-	st.FreeBytes, _ = s.cfg.free(s.cfg.CacheDir)
+	var err error
+	if st.FreeBytes, err = s.cfg.free(s.cfg.CacheDir); err != nil {
+		st.FreeBytes = -1
+	}
 	return st
 }
