@@ -634,7 +634,14 @@ type Stats struct {
 	FillErrors uint64
 	// EvictErrors is the worker failing to measure or free space.
 	EvictErrors uint64
-	LastError   string        // most recent of either, "" if none
+	// CacheReadErrors is a chunk that WAS cached but could not be read or
+	// mapped, so the read fell through to the network. The fallthrough is
+	// correct and produces a right answer every time, which is exactly why it
+	// needs a counter: an EIO storm or a process at vm.max_map_count is
+	// otherwise indistinguishable from a cold cache, at 100% GET rates and
+	// with every chunk resident on the heap.
+	CacheReadErrors uint64
+	LastError       string        // most recent of any of the three, "" if none
 	VictimAge   time.Duration // age of the last window dropped, 0 if none yet
 	// FreeBytes is what statfs says now, and -1 WHEN STATFS ITSELF FAILED:
 	// zero would read as "disk full", the one explanation that is certainly
@@ -649,7 +656,9 @@ func (s *Store) Stats() Stats {
 		Refusals:    s.refusals.Load(),
 		FillErrors:  s.fillErrors.Load(),
 		EvictErrors: s.evictErrors.Load(),
-		MinFree:     s.cfg.CacheMinFree,
+
+		CacheReadErrors: s.cacheReadErrors.Load(),
+		MinFree:         s.cfg.CacheMinFree,
 	}
 	st.LastError, _ = s.lastErr.Load().(string)
 	if w, _ := s.horizon.Load().(string); w != "" {

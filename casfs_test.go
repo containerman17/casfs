@@ -1909,3 +1909,62 @@ func TestFetchConcurrencyIsBoundedAcrossChunks(t *testing.T) {
 	close(gate)
 	wg.Wait()
 }
+
+// TestUnreadableCachedChunkIsCounted: a cached chunk that will not read (EIO,
+// or here a name that is not a regular file) correctly falls through to the
+// network and returns the right bytes. That silence was the problem: with
+// every cached chunk unreadable the store is a pure S3 passthrough at full
+// GET rates, and nothing in Stats said so.
+func TestUnreadableCachedChunkIsCounted(t *testing.T) {
+	f := newFakeS3(t)
+	s := newStore(t, f, "", 1024)
+	data := randBytes(1024*2, 21)
+	hash := f.seed(t, s, "", data)
+
+	file, err := s.Open(hash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	if got := readAll(t, file); !bytes.Equal(got, data) {
+		t.Fatal("the warming read returned the wrong bytes")
+	}
+	if st := s.Stats(); st.CacheReadErrors != 0 {
+		t.Fatalf("CacheReadErrors = %d after a healthy read, want 0", st.CacheReadErrors)
+	}
+
+	// Turn every cached chunk into a directory of the same name: open still
+	// succeeds, ReadAt and mmap do not.
+	for name, w := range cachedNames(t, s) {
+		p := filepath.Join(s.chunkDir(w), name)
+		if err := os.Remove(p); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Mkdir(p, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if got := readAll(t, file); !bytes.Equal(got, data) {
+		t.Fatal("the fallthrough to the network returned the wrong bytes")
+	}
+	st := s.Stats()
+	if st.CacheReadErrors == 0 || st.LastError == "" {
+		t.Fatalf("stats = %+v, want the unreadable cached chunks counted and named", st)
+	}
+
+	// View maps rather than preads, and its fallthrough is the one that leaves
+	// the chunk resident on the heap, so it counts too.
+	before := s.Stats().CacheReadErrors
+	v, err := file.View(0, int64(len(data)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(v.Slice(0, v.Len()), data) {
+		t.Fatal("a view over unmappable cached chunks returned the wrong bytes")
+	}
+	v.Close()
+	if got := s.Stats().CacheReadErrors; got <= before {
+		t.Fatalf("CacheReadErrors = %d after a failed mapping, want more than %d", got, before)
+	}
+}

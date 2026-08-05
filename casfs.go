@@ -165,6 +165,11 @@ type Store struct {
 	refusals    atomic.Uint64
 	fillErrors  atomic.Uint64
 	evictErrors atomic.Uint64
+	// cacheReadErrors is the cached copy being there but unusable: a ReadAt
+	// that failed, or a chunk that would not map. Each one silently becomes a
+	// network refetch, which is correct and invisible, so this is the only
+	// place the degradation shows.
+	cacheReadErrors atomic.Uint64
 	lastErr     atomic.Value // string: the last cache-plane failure
 	horizon     atomic.Value // string: the last window dropped
 }
@@ -905,6 +910,9 @@ func (f *File) ReadAt(p []byte, off int64) (int, error) {
 // readChunk preads out of one cached chunk, fetching it first if it is not
 // here. A cached file that reads short is treated as a miss and refetched: it
 // cannot happen (fills fsync before the rename) and costs one GET if it does.
+// The refetch is right for that case and stays; what it must not do is stay
+// invisible, because an EIO storm turns every read into a GET and nothing
+// else would say so, hence the CacheReadErrors count.
 func (s *Store) readChunk(a *artifact, idx int64, p []byte, off int64) (int, error) {
 	name := chunkName(a.hash, idx)
 	cf, err := s.openChunk(name)
@@ -917,6 +925,7 @@ func (s *Store) readChunk(a *artifact, idx int64, p []byte, off int64) (int, err
 		if err == nil {
 			return n, nil
 		}
+		s.note(&s.cacheReadErrors, "read cached chunk "+name, err)
 	}
 	b, err := s.fetch(a, idx)
 	if err != nil {
@@ -976,6 +985,11 @@ func (f *File) View(off, n int64) (*View, error) {
 // chunkView hands back one chunk's bytes for the life of a View: a mapping of
 // the cache file when it is there, and the fetched bytes on the heap when the
 // disk was over the watermark and refused them.
+//
+// A mapping that fails falls through to the heap, which is the right answer
+// and stays. It is also the failure mode with no other symptom: at
+// vm.max_map_count every view becomes a GET plus a resident copy, so the
+// fallthrough is counted (CacheReadErrors) rather than merely taken.
 func (s *Store) chunkView(a *artifact, idx int64) ([]byte, bool, error) {
 	name := chunkName(a.hash, idx)
 	n := chunkLen(a.size, s.cfg.ChunkSize, idx)
@@ -987,6 +1001,7 @@ func (s *Store) chunkView(a *artifact, idx int64) ([]byte, bool, error) {
 		if err == nil {
 			return b, true, nil
 		}
+		s.note(&s.cacheReadErrors, "map cached chunk "+name, err)
 	}
 	b, err := s.fetch(a, idx)
 	if err != nil {
@@ -998,6 +1013,7 @@ func (s *Store) chunkView(a *artifact, idx int64) ([]byte, bool, error) {
 		if err == nil {
 			return m, true, nil
 		}
+		s.note(&s.cacheReadErrors, "map filled chunk "+name, err)
 	}
 	return b, false, nil
 }

@@ -307,6 +307,14 @@ the same pass.
 honest cache horizon: how long a chunk actually survives here. A byte budget
 could only ever have reported its own configuration back.
 
+It also reports the failures that have no caller to return them to, because
+every one of them still produces a right answer and is therefore invisible:
+`FillErrors` (a fill that could not land), `EvictErrors` (the worker could not
+measure or free space) and `CacheReadErrors` (a chunk that WAS cached but
+would not read or map, so the read went to the network instead). A node
+climbing on any of these is an S3 passthrough with a healthy-looking hit
+story, and `LastError` names the most recent one.
+
 ## Views: the one place mappings are allowed
 
 `ReadAt` is the query path and it copies. Use it for everything transient.
