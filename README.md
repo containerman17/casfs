@@ -84,7 +84,16 @@ A chunk miss is filled from one of two sources, and that is the *only*
 difference between local and remote content:
 
 - the spool file is still there, so `pread` the aligned range out of it
-- it is not, so issue an aligned ranged GET
+- it is not, so fetch the chunk as `ceil(chunk / 1MB)` **parallel sub-ranges**
+  that tile it exactly, and assemble
+
+The split is transport only: S3 answers in ~20ms whatever the range's size and
+then moves ~100 MB/s per connection, so 4x1MB in parallel is ~31ms against
+~63ms for one serial 4MB GET. Every sub-range is checked against the
+`Content-Range` it comes back with, and one that fails, arrives short or
+arrives from the wrong offset fails the *whole* chunk. Sub-range requests are
+bounded store-wide by `FetchConcurrency` (default 16), not per chunk, because a
+joining node misses on many chunks at once.
 
 Concurrent misses on one chunk collapse into a single upstream read. **Every
 fill is verified against `list[i]` before it is cached or served**, and a

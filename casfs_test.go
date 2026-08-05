@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1610,4 +1611,301 @@ func TestFillFailuresAreCounted(t *testing.T) {
 	if st.Refusals != 0 {
 		t.Fatalf("Refusals = %d, want 0: the disk was not over its watermark", st.Refusals)
 	}
+}
+
+// ---------- parallel sub-range fetch ----------
+
+// splitAt shrinks the sub-range unit for the duration of a test, so the split
+// can be driven with kilobytes instead of megabytes.
+func splitAt(t *testing.T, n int64) {
+	t.Helper()
+	old := subRangeSize
+	t.Cleanup(func() { subRangeSize = old })
+	subRangeSize = n
+}
+
+// subRanges is every range asked for AFTER the first, i.e. everything past the
+// one ranged GET that Open spends on the tail and the last content chunk,
+// sorted, because they are issued concurrently and arrive in any order.
+func subRanges(f *fakeS3) [][2]int64 {
+	got := f.rangesAsked()
+	if len(got) > 0 {
+		got = got[1:]
+	}
+	sort.Slice(got, func(i, j int) bool { return got[i][0] < got[j][0] })
+	return got
+}
+
+// TestColdChunkIsFetchedAsSubRangesThatTileIt: a chunk comes down as several
+// parallel ranged GETs that cover it exactly, with no gap and no overlap, and
+// the assembled bytes are the same ones a single serial GET produced.
+func TestColdChunkIsFetchedAsSubRangesThatTileIt(t *testing.T) {
+	splitAt(t, 1024)
+	const cs = 4096
+	f := newFakeS3(t)
+	s := newStore(t, f, "", cs)
+	data := randBytes(cs*2, 91)
+	hash := f.seed(t, s, "", data)
+
+	file, err := s.Open(hash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+
+	p := make([]byte, cs)
+	if _, err := file.ReadAt(p, 0); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(p, data[:cs]) {
+		t.Fatal("the assembled chunk is not the artifact's bytes")
+	}
+	got := subRanges(f)
+	if len(got) != cs/1024 {
+		t.Fatalf("a %d byte chunk was fetched as %d sub-ranges, want %d", cs, len(got), cs/1024)
+	}
+	for i, r := range got {
+		want := [2]int64{int64(i) * 1024, int64(i)*1024 + 1023}
+		if r != want {
+			t.Fatalf("sub-range %d is %v, want %v: the sub-ranges must tile the chunk with no gap or overlap", i, r, want)
+		}
+	}
+
+	// And the same content over a store that fetches serially, which is the
+	// byte-identity claim: only the transport changed.
+	subRangeSize = cs
+	f2 := newFakeS3(t)
+	s2 := newStore(t, f2, "", cs)
+	if h2 := f2.seed(t, s2, "", data); h2 != hash {
+		t.Fatalf("the same content named %s and %s", hash, h2)
+	}
+	file2, err := s2.Open(hash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file2.Close()
+	if serial := readAll(t, file2); !bytes.Equal(serial, readAll(t, file)) {
+		t.Fatal("the parallel path and the serial path disagree about the bytes")
+	}
+}
+
+// TestShortLastChunkStaysOneRequest: the tail is fetched with the last content
+// chunk in ONE ranged GET, and a chunk smaller than the sub-range unit is one
+// request, not several. The split must not cost extra round trips where there
+// was only ever one.
+func TestShortLastChunkStaysOneRequest(t *testing.T) {
+	splitAt(t, 1024)
+	const cs = 4096
+	f := newFakeS3(t)
+	s := newStore(t, f, "", cs)
+	data := randBytes(cs+700, 92) // one full chunk and a 700 byte last one
+	hash := f.seed(t, s, "", data)
+
+	file, err := s.Open(hash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	if n := f.count("GET"); n != 1 {
+		t.Fatalf("opening an artifact cost %d ranged GETs, want 1 for the tail and the last chunk", n)
+	}
+	// The last chunk came with the tail, so reading it costs nothing more.
+	if _, err := file.ReadAt(make([]byte, 700), cs); err != nil {
+		t.Fatal(err)
+	}
+	if n := f.count("GET"); n != 1 {
+		t.Fatalf("reading the last chunk cost %d GETs, want it served from the open", n)
+	}
+	if got := readAll(t, file); !bytes.Equal(got, data) {
+		t.Fatal("read back differed")
+	}
+}
+
+// TestSubRangeFromTheWrongOffsetFailsTheChunk: the Content-Range start check
+// applies to EVERY sub-range, not just the first. A sub-range answered from
+// somewhere else must fail the whole chunk and cache nothing, because a chunk
+// assembled around a mis-answered range would be neither detectably wrong at
+// the transport nor re-verified once it was on disk.
+func TestSubRangeFromTheWrongOffsetFailsTheChunk(t *testing.T) {
+	splitAt(t, 1024)
+	const cs = 4096
+	f := newFakeS3(t)
+	s := newStore(t, f, "", cs)
+	data := randBytes(cs*2, 93)
+	hash := f.seed(t, s, "", data)
+
+	file, err := s.Open(hash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+
+	// The THIRD sub-range of chunk 0 only: its siblings answer honestly.
+	f.mu.Lock()
+	f.shiftFrom, f.rangeShift = 2048, 1
+	f.mu.Unlock()
+
+	_, err = file.ReadAt(make([]byte, cs), 0)
+	if err == nil {
+		t.Fatal("a chunk assembled around a mis-answered sub-range was served")
+	}
+	if !strings.Contains(err.Error(), "asked for byte 2048") || !strings.Contains(err.Error(), "sub-range") {
+		t.Fatalf("err = %v, want the offending sub-range named", err)
+	}
+	if _, ok := cachedNames(t, s)[chunkName(hash, 0)]; ok {
+		t.Fatal("a chunk with a mis-answered sub-range in it was cached")
+	}
+
+	f.mu.Lock()
+	f.shiftFrom, f.rangeShift = 0, 0
+	f.mu.Unlock()
+	if got := readAll(t, file); !bytes.Equal(got, data) {
+		t.Fatal("honest sub-ranges returned the wrong bytes")
+	}
+}
+
+// TestOneFailedSubRangeFailsTheWholeChunk: a sub-range that never arrives is
+// not a hole in the chunk, it is a failed fill, and the error says which chunk
+// and which bytes.
+func TestOneFailedSubRangeFailsTheWholeChunk(t *testing.T) {
+	splitAt(t, 1024)
+	const cs = 4096
+	f := newFakeS3(t)
+	s := newStore(t, f, "", cs)
+	data := randBytes(cs*2, 94)
+	hash := f.seed(t, s, "", data)
+
+	file, err := s.Open(hash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+
+	f.mu.Lock()
+	f.failAt = 3072 // the last sub-range of chunk 0
+	f.mu.Unlock()
+
+	_, err = file.ReadAt(make([]byte, cs), 0)
+	if err == nil {
+		t.Fatal("a chunk missing a sub-range was served")
+	}
+	if !strings.Contains(err.Error(), "chunk 0") || !strings.Contains(err.Error(), "[3072,4096)") {
+		t.Fatalf("err = %v, want the chunk and the missing byte range named", err)
+	}
+	if _, ok := cachedNames(t, s)[chunkName(hash, 0)]; ok {
+		t.Fatal("a chunk with a missing sub-range was cached")
+	}
+
+	f.mu.Lock()
+	f.failAt = -1
+	f.mu.Unlock()
+	if got := readAll(t, file); !bytes.Equal(got, data) {
+		t.Fatal("the chunk did not read once the bucket answered")
+	}
+}
+
+// TestSingleflightHoldsAcrossSubRanges: the per-chunk singleflight is what it
+// always was. N readers landing on one cold chunk together still cause ONE
+// fetch, now made of K sub-requests rather than K per reader.
+func TestSingleflightHoldsAcrossSubRanges(t *testing.T) {
+	splitAt(t, 1024)
+	const cs = 4096
+	f := newFakeS3(t)
+	s := newStore(t, f, "", cs)
+	data := randBytes(cs*2, 95)
+	hash := f.seed(t, s, "", data)
+
+	file, err := s.Open(hash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+
+	const readers = 32
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	errs := make(chan error, readers)
+	for i := 0; i < readers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			p := make([]byte, 64)
+			off := int64(i * 37)
+			if _, err := file.ReadAt(p, off); err != nil {
+				errs <- err
+			} else if !bytes.Equal(p, data[off:off+64]) {
+				errs <- fmt.Errorf("reader %d got the wrong bytes", i)
+			}
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatal(err)
+	}
+	if got := subRanges(f); len(got) != cs/1024 {
+		t.Fatalf("%d readers of one cold chunk cost %d sub-requests, want %d", readers, len(got), cs/1024)
+	}
+}
+
+// TestFetchConcurrencyIsBoundedAcrossChunks: the bound is the STORE's, not the
+// chunk's. Three cold chunks at four sub-ranges each are twelve requests
+// waiting to be made, and the store must never have more than
+// FetchConcurrency of them on the wire.
+func TestFetchConcurrencyIsBoundedAcrossChunks(t *testing.T) {
+	splitAt(t, 1024)
+	const cs, bound = 4096, 3
+	f := newFakeS3(t)
+	s := newStore(t, f, "", cs, func(c *Config) { c.FetchConcurrency = bound })
+	data := randBytes(cs*4, 96)
+	hash := f.seed(t, s, "", data)
+
+	file, err := s.Open(hash) // the tail read, before the gate goes up
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+
+	gate := make(chan struct{})
+	f.mu.Lock()
+	f.gate = gate
+	f.mu.Unlock()
+
+	var wg sync.WaitGroup
+	for i := 0; i < 3; i++ { // chunks 0, 1 and 2, all cold
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			p := make([]byte, cs)
+			if _, err := file.ReadAt(p, int64(i)*cs); err != nil {
+				t.Errorf("chunk %d: %v", i, err)
+			} else if !bytes.Equal(p, data[i*cs:(i+1)*cs]) {
+				t.Errorf("chunk %d read the wrong bytes", i)
+			}
+		}(i)
+	}
+
+	inflight := func() int {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		return f.inflight
+	}
+	for deadline := time.Now().Add(5 * time.Second); inflight() < bound; {
+		if time.Now().After(deadline) {
+			t.Fatalf("only %d sub-requests ever in flight, want the store to use its whole bound of %d", inflight(), bound)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	// A store that did not bound itself would have fired all twelve by now.
+	time.Sleep(100 * time.Millisecond)
+	f.mu.Lock()
+	peak := f.peak
+	f.mu.Unlock()
+	if peak > bound {
+		t.Fatalf("%d sub-requests in flight at once, over the bound of %d", peak, bound)
+	}
+	close(gate)
+	wg.Wait()
 }

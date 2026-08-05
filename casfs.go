@@ -107,6 +107,13 @@ type Config struct {
 	// means DefaultMaxAge.
 	CacheMaxAge time.Duration
 
+	// FetchConcurrency bounds the sub-range GETs in flight ACROSS THE WHOLE
+	// STORE, which is the only bound that means anything: a joining node misses
+	// on many chunks at once and each miss is several requests, so a per-chunk
+	// limit would multiply into a request storm the NIC cannot absorb. Zero
+	// means defaultFetchConcurrency.
+	FetchConcurrency int
+
 	HTTPClient *http.Client // optional
 
 	// free is the statfs seam, so a test can put the store over its watermark
@@ -135,6 +142,11 @@ type Store struct {
 	// walk at startup. A stale entry costs an ENOENT and a refetch.
 	where  map[string]string
 	flight map[string]*flight
+
+	// sem is the store-wide ceiling on sub-range GETs in flight (see pull). It
+	// is a buffered channel and nothing else: the only thing being counted is
+	// requests, and every holder releases it in a defer.
+	sem chan struct{}
 
 	// ptrMu guards the pointer files and dirty together, so a SetPointer
 	// racing a reconcile cannot have its value uploaded and then released
@@ -176,6 +188,9 @@ func New(cfg Config) (*Store, error) {
 	}
 	if cfg.Namespace == "" {
 		cfg.Namespace = "default"
+	}
+	if cfg.FetchConcurrency <= 0 {
+		cfg.FetchConcurrency = defaultFetchConcurrency
 	}
 	// It names a directory this store creates and deletes inside, so it may
 	// not be a path: a caller passing a data directory's name must not be able
@@ -232,6 +247,7 @@ func New(cfg Config) (*Store, error) {
 		confirmed: map[string]bool{},
 		where:     map[string]string{},
 		flight:    map[string]*flight{},
+		sem:       make(chan struct{}, cfg.FetchConcurrency),
 		dirty:     map[string]bool{},
 		stop:      make(chan struct{}),
 		done:      make(chan struct{}),

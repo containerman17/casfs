@@ -319,9 +319,44 @@ func (s *Store) fetch(a *artifact, idx int64) ([]byte, error) {
 	return fl.b, fl.err
 }
 
+// A COLD CHUNK COMES DOWN AS PARALLEL SUB-RANGES, NOT ONE SERIAL GET.
+//
+// Measured on S3 Standard (2026-08-05, the numbers behind this change): time
+// to first byte is ~20 ms whatever the object's size, and one connection then
+// moves 93-109 MB/s. A serial 4MB chunk is therefore ~20 ms + ~43 ms = ~63 ms,
+// while four 1MB sub-ranges fetched together are ~20 ms + ~11 ms = ~31 ms, on
+// the same bucket and for free. It is also what AWS's own performance design
+// patterns recommend (parallel byte-range fetches).
+//
+// THE COUNT IS DERIVED, NOT CONFIGURED: ceil(chunk / subRangeSize), i.e. 4 at
+// the 4MB default, and 1 for a short last chunk, which keeps a small chunk one
+// request instead of turning it into several. The metadata tail is not split
+// at all; readIdentity fetches it in the one ranged GET that already carries
+// the last content chunk with it.
+//
+// Vars, not consts, so a test can drive the split with kilobytes instead of
+// megabytes. A future measurement changes these two lines and nothing else.
+var (
+	subRangeSize int64 = 1 << 20
+	// defaultFetchConcurrency is the ceiling on sub-range requests in flight
+	// ACROSS THE WHOLE STORE. At ~100 MB/s per connection, 16 of them is
+	// ~1.6 GB/s, about what a 12 Gbit NIC can absorb; more only queues in the
+	// kernel and on the wire while multiplying the request rate of a joining
+	// node, which misses on many chunks at once.
+	defaultFetchConcurrency = 16
+)
+
 // pull reads a chunk's bytes from the spool file when the artifact is still
-// local and by a ranged GET when it is not. That is the only respect in which
+// local and by ranged GETs when it is not. That is the only respect in which
 // spooled and remote content differ anywhere.
+//
+// A REMOTE CHUNK IS ASSEMBLED FROM SUB-RANGES THAT TILE IT EXACTLY, with no
+// gap and no overlap, and the caller (fetch) hashes the assembled bytes
+// against the artifact's own list before anything is cached or served. Every
+// sub-range goes through the same s3.get, so the Content-Range start check
+// covers each of them and not merely the first. Any sub-range that fails,
+// arrives short, or arrives from the wrong offset fails THE WHOLE CHUNK: a
+// hole must never reach the verifier, let alone the cache.
 func (s *Store) pull(a *artifact, idx int64) ([]byte, error) {
 	off := idx * s.cfg.ChunkSize
 	n := chunkLen(a.size, s.cfg.ChunkSize, idx)
@@ -335,22 +370,52 @@ func (s *Store) pull(a *artifact, idx int64) ([]byte, error) {
 	} else if !errors.Is(err, fs.ErrNotExist) {
 		return nil, err
 	}
-	body, total, err := s.s3.get(s.key(a.hash), off, n)
-	if err != nil {
+	errs := make([]error, (n+subRangeSize-1)/subRangeSize)
+	var wg sync.WaitGroup
+	for i := range errs {
+		lo := int64(i) * subRangeSize
+		hi := min(lo+subRangeSize, n)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			// The semaphore is the store's, not this chunk's: N cold chunks at
+			// K sub-ranges each still add up to at most FetchConcurrency
+			// requests on the wire.
+			s.sem <- struct{}{}
+			defer func() { <-s.sem }()
+			errs[i] = s.getRange(a, idx, off+lo, b[lo:hi])
+		}()
+	}
+	wg.Wait()
+	if err := errors.Join(errs...); err != nil {
 		return nil, err
+	}
+	return b, nil
+}
+
+// getRange fills p with [off, off+len(p)) of the stored object. There is no
+// retry ladder here on purpose: the caller treats a failed fill as a miss, and
+// a legible error naming the artifact, the chunk and the byte range is worth
+// more than a silent degradation to wrong or partial bytes.
+func (s *Store) getRange(a *artifact, idx, off int64, p []byte) error {
+	fail := func(err error) error {
+		return fmt.Errorf("casfs: chunk %d of %s, sub-range [%d,%d): %w", idx, a.hash, off, off+int64(len(p)), err)
+	}
+	body, total, err := s.s3.get(s.key(a.hash), off, int64(len(p)))
+	if err != nil {
+		return fail(err)
 	}
 	defer body.Close()
 	// A cheap early-out on the wrong object. It is no longer the integrity
 	// check (fetch hashes these bytes against the artifact's own list), but a
 	// size mismatch names the failure better than a hash mismatch does.
 	if total != a.stored {
-		return nil, fmt.Errorf("casfs: chunk %d of %s: the bucket's object is %d bytes, this store expected %d",
-			idx, a.hash, total, a.stored)
+		return fail(fmt.Errorf("the bucket's object is %d bytes, this store expected %d", total, a.stored))
 	}
-	if _, err := io.ReadFull(body, b); err != nil {
-		return nil, err
+	if _, err := io.ReadFull(body, p); err != nil {
+		return fail(err)
 	}
-	return b, nil
+	return nil
 }
 
 // roomy reports whether the filesystem is under the watermark. THE ERROR IS

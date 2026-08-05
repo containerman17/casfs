@@ -34,13 +34,34 @@ type fakeS3 struct {
 	failComplete bool
 	// rangeShift offsets every ranged answer, standing in for a bucket that
 	// hands back bytes from somewhere other than where they were asked for.
+	// shiftFrom limits it to ranges starting at or after that byte, so a test
+	// can mis-answer a sub-range that is NOT the first one of a chunk.
 	rangeShift int64
+	shiftFrom  int64
+	// failAt is the start offset of a ranged GET the bucket refuses outright,
+	// -1 for none: one sub-range of a chunk failing while its siblings arrive.
+	failAt int64
+	// ranges is every range asked for, as requested (before any shift), in
+	// arrival order.
+	ranges [][2]int64
+	// gate, when non-nil, holds every GET until it is closed, so a test can
+	// see how many the store is willing to have in flight at once.
+	gate     chan struct{}
+	inflight int
+	peak     int
 }
 
 func (f *fakeS3) setRangeShift(n int64) {
 	f.mu.Lock()
 	f.rangeShift = n
 	f.mu.Unlock()
+}
+
+// rangesAsked is a copy of the ranges the store has asked for so far.
+func (f *fakeS3) rangesAsked() [][2]int64 {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([][2]int64(nil), f.ranges...)
 }
 
 func newFakeS3(t *testing.T) *fakeS3 {
@@ -50,6 +71,7 @@ func newFakeS3(t *testing.T) *fakeS3 {
 		objects: map[string][]byte{},
 		counts:  map[string]int{},
 		uploads: map[string][][]byte{},
+		failAt:  -1,
 	}
 	f.Server = httptest.NewServer(http.HandlerFunc(f.serve))
 	t.Cleanup(f.Server.Close)
@@ -131,12 +153,30 @@ func (f *fakeS3) serve(w http.ResponseWriter, r *http.Request) {
 			w.Write(obj)
 			return
 		}
+		f.mu.Lock()
+		f.ranges = append(f.ranges, [2]int64{start, end})
+		shift, refuse, gate := f.rangeShift, start == f.failAt, f.gate
+		if start < f.shiftFrom {
+			shift = 0
+		}
+		f.inflight++
+		f.peak = max(f.peak, f.inflight)
+		f.mu.Unlock()
+		if gate != nil {
+			<-gate
+		}
+		defer func() {
+			f.mu.Lock()
+			f.inflight--
+			f.mu.Unlock()
+		}()
+		if refuse {
+			http.Error(w, "<Error><Code>InternalError</Code></Error>", http.StatusInternalServerError)
+			return
+		}
 		// A bucket that answers from an offset nobody asked for: a caching
 		// proxy serving a neighbouring range, or a rewritten key. It reports
 		// the range it actually sent, which is the whole point.
-		f.mu.Lock()
-		shift := f.rangeShift
-		f.mu.Unlock()
 		start, end = start+shift, end+shift
 		if start >= int64(len(obj)) {
 			http.Error(w, "<Error><Code>InvalidRange</Code></Error>", http.StatusRequestedRangeNotSatisfiable)
