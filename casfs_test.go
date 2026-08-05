@@ -3,7 +3,6 @@ package casfs
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -107,12 +106,29 @@ func writeFile(t *testing.T, s *Store, data []byte) string {
 	return p
 }
 
-// spool writes data straight into the spool dir under a chosen name, with no
-// library call at all. That rename is the whole registration protocol.
+// artifactOf builds a STORED OBJECT out of content the way a producer does:
+// content, then the chunk hash list, then the trailer. Tests use it rather
+// than the library's own writers so the format is exercised from the outside.
+func artifactOf(t *testing.T, data []byte, cs int64) (string, []byte) {
+	t.Helper()
+	h := NewHasher(cs)
+	h.Write(data)
+	name, tail, err := h.Finish()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return name, append(append([]byte(nil), data...), tail...)
+}
+
+// spool writes an artifact straight into the spool dir under a CHOSEN name,
+// with no library call at all. That rename is the whole registration protocol.
+// The name is chosen rather than derived so a test can spool a file whose name
+// lies about its contents.
 func spool(t *testing.T, s *Store, name string, data []byte) {
 	t.Helper()
+	_, obj := artifactOf(t, data, s.cfg.ChunkSize)
 	tmp := filepath.Join(s.cfg.SpoolDir, ".staging")
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+	if err := os.WriteFile(tmp, obj, 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.Rename(tmp, s.SpoolPath(name)); err != nil {
@@ -122,18 +138,20 @@ func spool(t *testing.T, s *Store, name string, data []byte) {
 
 // seed drops content straight into the fake bucket, so the store has never seen
 // it locally.
-func (f *fakeS3) seed(prefix string, data []byte) string {
-	sum := sha256.Sum256(data)
-	h := hex.EncodeToString(sum[:])
+func (f *fakeS3) seed(t *testing.T, s *Store, prefix string, data []byte) string {
+	t.Helper()
+	name, obj := artifactOf(t, data, s.cfg.ChunkSize)
 	f.mu.Lock()
-	f.objects[prefix+h] = data
+	f.objects[prefix+name] = obj
 	f.mu.Unlock()
-	return h
+	return name
 }
 
-func hashOf(data []byte) string {
-	sum := sha256.Sum256(data)
-	return hex.EncodeToString(sum[:])
+// hashOf is the artifact NAME of this content: sha256 of its chunk hash list.
+func hashOf(t *testing.T, s *Store, data []byte) string {
+	t.Helper()
+	name, _ := artifactOf(t, data, s.cfg.ChunkSize)
+	return name
 }
 
 func readAll(t *testing.T, file *File) []byte {
@@ -223,8 +241,8 @@ func TestFillAndReadRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if hash != hashOf(data) {
-		t.Fatalf("Put returned %s, want %s", hash, hashOf(data))
+	if hash != hashOf(t, s, data) {
+		t.Fatalf("Put returned %s, want %s", hash, hashOf(t, s, data))
 	}
 	if done := mustSync(t, s); len(done) != 1 || done[0] != hash {
 		t.Fatalf("Sync confirmed %v, want [%s]", done, hash)
@@ -260,7 +278,7 @@ func TestReadAtCrossesChunkBoundaries(t *testing.T) {
 	f := newFakeS3(t)
 	s := newStore(t, f, "", 1024)
 	data := randBytes(1024*5+7, 2)
-	hash := f.seed("", data)
+	hash := f.seed(t, s, "", data)
 
 	file, err := s.Open(hash)
 	if err != nil {
@@ -288,7 +306,7 @@ func TestCacheHitNeedsNoNetwork(t *testing.T) {
 	f := newFakeS3(t)
 	s := newStore(t, f, "", 1024)
 	data := randBytes(1024*3, 3)
-	hash := f.seed("", data)
+	hash := f.seed(t, s, "", data)
 
 	file, err := s.Open(hash)
 	if err != nil {
@@ -317,7 +335,7 @@ func TestStartupWalkRebuildsTheMap(t *testing.T) {
 	f := newFakeS3(t)
 	s := newStore(t, f, "", 1024)
 	data := randBytes(1024*4, 11)
-	hash := f.seed("", data)
+	hash := f.seed(t, s, "", data)
 
 	file, err := s.Open(hash)
 	if err != nil {
@@ -360,7 +378,7 @@ func TestAdmissionRefusesOverWatermark(t *testing.T) {
 	free.Store(0) // full
 	s := newStore(t, f, "", 1024, fakeDisk(&free, 1<<20))
 	data := randBytes(1024*3, 4)
-	hash := f.seed("", data)
+	hash := f.seed(t, s, "", data)
 
 	file, err := s.Open(hash)
 	if err != nil {
@@ -481,7 +499,7 @@ func TestPromoteOnTouchFromAnyOlderWindow(t *testing.T) {
 	f := newFakeS3(t)
 	s := newStore(t, f, "", 1024)
 	data := randBytes(1024*2, 5)
-	hash := f.seed("", data)
+	hash := f.seed(t, s, "", data)
 
 	// One chunk one window back, one chunk a day back: both must move.
 	plant(t, s, winBack(1), "", chunkName(hash, 0), data[:1024])
@@ -517,7 +535,7 @@ func TestSingleflightCollapsesConcurrentMisses(t *testing.T) {
 	f := newFakeS3(t)
 	s := newStore(t, f, "", 1<<16)
 	data := randBytes(1<<16, 6)
-	hash := f.seed("", data)
+	hash := f.seed(t, s, "", data)
 
 	file, err := s.Open(hash)
 	if err != nil {
@@ -632,7 +650,7 @@ func TestTornWriteNeverBecomesAChunk(t *testing.T) {
 	s := newStore(t, f, "", 1024)
 	stopped(t, s)
 	data := randBytes(1024*2, 8)
-	hash := f.seed("", data)
+	hash := f.seed(t, s, "", data)
 
 	torn := chunkName(hash, 0) + ".999.tmp"
 	plant(t, s, curWindow(), "", torn, data[:100]) // the write died a tenth in
@@ -659,7 +677,7 @@ func TestReadsTolerateChunksVanishing(t *testing.T) {
 	f := newFakeS3(t)
 	s := newStore(t, f, "", 4096)
 	data := randBytes(4096*16, 9)
-	hash := f.seed("", data)
+	hash := f.seed(t, s, "", data)
 
 	stop := make(chan struct{})
 	var deleter sync.WaitGroup
@@ -752,7 +770,7 @@ func TestViewSpansChunksAndCopiesAtBoundary(t *testing.T) {
 	f := newFakeS3(t)
 	s := newStore(t, f, "", 1024)
 	data := randBytes(1024*5, 12)
-	hash := f.seed("", data)
+	hash := f.seed(t, s, "", data)
 
 	file, err := s.Open(hash)
 	if err != nil {
@@ -801,7 +819,7 @@ func TestViewFromSpoolSurvivesRelease(t *testing.T) {
 	f := newFakeS3(t)
 	s := newStore(t, f, "", 1024)
 	data := randBytes(1024*3, 13)
-	hash := hashOf(data)
+	hash := hashOf(t, s, data)
 	spool(t, s, hash, data)
 
 	file, err := s.Open(hash)
@@ -838,7 +856,7 @@ func TestSpoolToRemoteTransition(t *testing.T) {
 	f := newFakeS3(t)
 	s := newStore(t, f, "", 1024)
 	data := randBytes(1024*6, 14)
-	hash := hashOf(data)
+	hash := hashOf(t, s, data)
 	spool(t, s, hash, data)
 
 	local, err := s.Open(hash)
@@ -888,7 +906,7 @@ func TestSpoolRenameSurvivesRestart(t *testing.T) {
 	f := newFakeS3(t)
 	s := newStore(t, f, "epoch/", 1024)
 	data := randBytes(4000, 15)
-	hash := hashOf(data)
+	hash := hashOf(t, s, data)
 	spool(t, s, hash, data)
 
 	s2 := reopen(t, s)
@@ -903,24 +921,30 @@ func TestSpoolRenameSurvivesRestart(t *testing.T) {
 	if done := mustSync(t, s2); len(done) != 1 || done[0] != hash {
 		t.Fatalf("Sync confirmed %v, want [%s]", done, hash)
 	}
+	_, obj := artifactOf(t, data, s2.cfg.ChunkSize)
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if !bytes.Equal(f.objects["epoch/"+hash], data) {
+	if !bytes.Equal(f.objects["epoch/"+hash], obj) {
 		t.Fatal("the bucket does not hold the spooled bytes")
 	}
 }
 
-// TestSpoolNameMismatchRejected proves a compliant endpoint refuses to store
-// bytes that do not match the signed payload hash: the request itself carries
-// the check, and its rejection is the error the operator sees.
+// TestSpoolNameMismatchRejected: a spool file whose name does not match the
+// chunk list its own content produces is refused by the pre-pass, BEFORE a
+// byte goes out. The endpoint's payload-hash check can no longer stand in for
+// this, because the signed digest is now the stored object's sha256 and the
+// name is sha256 of the hash list, so only casfs can tell the two apart.
 func TestSpoolNameMismatchRejected(t *testing.T) {
 	f := newFakeS3(t)
 	s := newStore(t, f, "", 1024)
-	name := hashOf([]byte("one thing"))
+	name := hashOf(t, s, []byte("one thing"))
 	spool(t, s, name, []byte("quite another"))
 
-	if _, err := s.Sync(); err == nil || !strings.Contains(err.Error(), "XAmzContentSHA256Mismatch") {
-		t.Fatalf("Sync err=%v, want the endpoint's payload-hash refusal", err)
+	if _, err := s.Sync(); err == nil || !strings.Contains(err.Error(), "refusing it") {
+		t.Fatalf("Sync err=%v, want the name/content mismatch", err)
+	}
+	if n := f.count("PUT"); n != 0 {
+		t.Fatalf("%d PUTs for a file whose name lies, want 0", n)
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -988,7 +1012,7 @@ func transportStore(t *testing.T, rt http.RoundTripper) *Store {
 func TestUploadFailureIsNeverCalledCorruption(t *testing.T) {
 	s := transportStore(t, putTransport{failAfter: 16})
 	data := randBytes(4000, 21)
-	hash := hashOf(data)
+	hash := hashOf(t, s, data)
 	spool(t, s, hash, data)
 
 	_, err := s.Sync()
@@ -1002,8 +1026,9 @@ func TestUploadFailureIsNeverCalledCorruption(t *testing.T) {
 		t.Fatalf("a failed upload was reported as corrupt content: %v", err)
 	}
 	// And the file it accused is exactly what it always was.
+	_, want := artifactOf(t, data, s.cfg.ChunkSize)
 	got, err := os.ReadFile(s.SpoolPath(hash))
-	if err != nil || hashOf(got) != hash {
+	if err != nil || !bytes.Equal(got, want) {
 		t.Fatalf("spool file changed under a failed upload: %v", err)
 	}
 }
@@ -1019,7 +1044,7 @@ func TestMultipartRoundTripOverTheThreshold(t *testing.T) {
 	f := newFakeS3(t)
 	s := newStore(t, f, "epoch/", 1024)
 	data := randBytes(10_000, 31) // three parts, the last one short
-	hash := hashOf(data)
+	hash := hashOf(t, s, data)
 	spool(t, s, hash, data)
 
 	if done := mustSync(t, s); len(done) != 1 || done[0] != hash {
@@ -1028,8 +1053,14 @@ func TestMultipartRoundTripOverTheThreshold(t *testing.T) {
 	f.mu.Lock()
 	stored := f.objects["epoch/"+hash]
 	f.mu.Unlock()
-	if !bytes.Equal(stored, data) {
-		t.Fatalf("assembled object is %d bytes, want %d", len(stored), len(data))
+	// THE SAME BYTES AND THE SAME NAME AS A SINGLE PUT WOULD HAVE PRODUCED:
+	// the name is a function of the content, never of how it went up.
+	wantName, wantObj := artifactOf(t, data, s.cfg.ChunkSize)
+	if wantName != hash {
+		t.Fatalf("multipart named the artifact %s, a single PUT names it %s", hash, wantName)
+	}
+	if !bytes.Equal(stored, wantObj) {
+		t.Fatalf("assembled object is %d bytes, want %d", len(stored), len(wantObj))
 	}
 	if f.count("PUT") != 3 {
 		t.Fatalf("%d part PUTs, want 3", f.count("PUT"))
@@ -1050,7 +1081,7 @@ func TestMultipartRoundTripOverTheThreshold(t *testing.T) {
 
 	// A file under the threshold still goes up whole: one PUT, no upload id.
 	small := randBytes(1000, 32)
-	spool(t, s, hashOf(small), small)
+	spool(t, s, hashOf(t, s, small), small)
 	mustSync(t, s)
 	if f.count("PUT") != 4 {
 		t.Fatalf("%d PUTs after a small file, want 4 (3 parts + 1 whole)", f.count("PUT"))
@@ -1066,7 +1097,7 @@ func TestMultipartNameLieIsRefusedBeforeAnythingIsStored(t *testing.T) {
 
 	f := newFakeS3(t)
 	s := newStore(t, f, "", 1024)
-	name := hashOf(randBytes(10_000, 34))
+	name := hashOf(t, s, randBytes(10_000, 34))
 	spool(t, s, name, randBytes(10_000, 35))
 
 	if _, err := s.Sync(); err == nil || !strings.Contains(err.Error(), "refusing it") {
@@ -1095,7 +1126,7 @@ func TestMultipartCompletionErrorInA200IsAFailure(t *testing.T) {
 	f.failComplete = true
 	s := newStore(t, f, "", 1024)
 	data := randBytes(10_000, 33)
-	hash := hashOf(data)
+	hash := hashOf(t, s, data)
 	spool(t, s, hash, data)
 
 	done, err := s.Sync()
@@ -1121,7 +1152,7 @@ func TestMultipartCompletionErrorInA200IsAFailure(t *testing.T) {
 // hash itself, which is the only reason the local check exists.
 func TestSpoolNameLieCaughtOnASuccessfulPut(t *testing.T) {
 	s := transportStore(t, putTransport{failAfter: -1})
-	name := hashOf([]byte("one thing"))
+	name := hashOf(t, s, []byte("one thing"))
 	spool(t, s, name, []byte("quite another"))
 
 	if _, err := s.Sync(); err == nil || !strings.Contains(err.Error(), "refusing it") {
@@ -1228,8 +1259,8 @@ func TestSyncUploadsContentBeforePointers(t *testing.T) {
 	var hashes []string
 	for i := 0; i < 3; i++ {
 		data := randBytes(2000, int64(i))
-		hashes = append(hashes, hashOf(data))
-		spool(t, s, hashOf(data), data)
+		hashes = append(hashes, hashOf(t, s, data))
+		spool(t, s, hashOf(t, s, data), data)
 	}
 	if err := s.SetPointer("latest", "epoch "+hashes[2]); err != nil {
 		t.Fatal(err)
@@ -1263,8 +1294,8 @@ func TestSyncUploadsContentBeforePointers(t *testing.T) {
 
 	// A pass that cannot upload some artifact publishes NO pointer: the
 	// pointer would name content the bucket does not have.
-	spool(t, s, hashOf([]byte("lies")), []byte("different bytes entirely"))
-	if err := s.SetPointer("latest", "epoch "+hashOf([]byte("lies"))); err != nil {
+	spool(t, s, hashOf(t, s, []byte("lies")), []byte("different bytes entirely"))
+	if err := s.SetPointer("latest", "epoch "+hashOf(t, s, []byte("lies"))); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.Sync(); err == nil {
@@ -1308,7 +1339,7 @@ func TestSyncIsIdempotent(t *testing.T) {
 	f := newFakeS3(t)
 	s := newStore(t, f, "", 1024)
 	data := randBytes(3000, 7)
-	hash := hashOf(data)
+	hash := hashOf(t, s, data)
 	spool(t, s, hash, data)
 
 	mustSync(t, s)
@@ -1462,28 +1493,28 @@ func TestNamespaceMustBeOnePathElement(t *testing.T) {
 	}
 }
 
-// TestRangeAnsweredFromTheWrongOffsetIsRefused is the read path's ONLY
-// integrity check. Chunk files are named <hash>.<index> and nothing hashes
-// them back, so bytes that arrive from an offset nobody asked for would be
-// admitted under a correct name and served as verified content forever. The
-// Content-Range start is the proof, and it is now compared.
+// TestRangeAnsweredFromTheWrongOffsetIsRefused: a range answered from an
+// offset nobody asked for is refused on the Content-Range start, before the
+// bytes are even hashed. Since the chunk list went in this is a cheap early
+// out rather than the integrity check (VerifyChunk would catch the same bytes
+// a moment later), but it names the failure far better than a hash mismatch.
 func TestRangeAnsweredFromTheWrongOffsetIsRefused(t *testing.T) {
 	f := newFakeS3(t)
 	s := newStore(t, f, "", 1024)
 	data := randBytes(1024*3, 9)
-	hash := f.seed("", data)
-	f.setRangeShift(1024) // every range answered one chunk late
+	hash := f.seed(t, s, "", data)
 
 	file, err := s.Open(hash)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer file.Close()
+	f.setRangeShift(1024) // every range answered one chunk late
 	if _, err := file.ReadAt(make([]byte, 1024), 0); err == nil {
 		t.Fatal("a range answered from the wrong offset was accepted as content")
 	}
-	if n := len(cachedNames(t, s)); n != 0 {
-		t.Fatalf("%d chunks cached from a mis-answered range, want 0", n)
+	if _, ok := cachedNames(t, s)[chunkName(hash, 0)]; ok {
+		t.Fatal("a chunk from a mis-answered range was cached")
 	}
 
 	// The same store reads fine the moment the bucket answers honestly, so the
@@ -1517,7 +1548,7 @@ func TestStatfsFailureNeverEvicts(t *testing.T) {
 	stopped(t, s) // drive the worker's decision by hand
 
 	data := randBytes(1024, 11)
-	plant(t, s, winBack(3), "", chunkName(hashOf(data), 0), data)
+	plant(t, s, winBack(3), "", chunkName(hashOf(t, s, data), 0), data)
 
 	broken.Store(true)
 	if s.step() {
@@ -1563,7 +1594,7 @@ func TestFillFailuresAreCounted(t *testing.T) {
 	t.Cleanup(func() { os.Chmod(s.cfg.CacheDir, 0o755) })
 
 	data := randBytes(1024*2, 12)
-	hash := f.seed("", data)
+	hash := f.seed(t, s, "", data)
 	file, err := s.Open(hash)
 	if err != nil {
 		t.Fatal(err)

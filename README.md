@@ -3,10 +3,14 @@
 A content-addressed file store on top of any S3-compatible bucket, with lazy
 chunked reads and a shared local disk cache.
 
-Whole files live in the bucket under their hex sha256, which is the entire
-object key (optionally behind a configured prefix). Uploads are therefore
-idempotent, and two writers racing on the same content write identical bytes,
-so there is nothing to coordinate.
+Whole files live in the bucket under one name, which is the entire object key
+(optionally behind a configured prefix). Uploads are therefore idempotent, and
+two writers racing on the same content write identical bytes, so there is
+nothing to coordinate.
+
+**The name is sha256 of the file's own per-chunk hash list**, so an artifact is
+self-authenticating at chunk granularity: every 4MB range the store serves is
+checked against that list before anyone sees it. See *The name* below.
 
 Locally, an object is cached as **plain 4MB chunk files under
 `<window>/<owner>/`**, where the window is a 20-minute UTC time bucket. Reads
@@ -16,20 +20,54 @@ process can map it, one mapping per chunk.
 Zero dependencies outside the standard library, apart from AWS credential
 resolution. Linux only: the cache uses `statfs` and `mmap` with no fallback.
 
+## The name
+
+A stored object is three runs of bytes:
+
+```
+[ content: L ][ hash list: 32*N ][ trailer: 16 ]
+```
+
+`N = ceil(L / chunk size)` and chunk `i` is `content[cs*i : min(cs*(i+1), L)]`.
+**The last chunk is short, never padded.** `list[i]` is sha256 of chunk `i`. The
+trailer is `u64 LE` of `L` followed by the 8-byte magic `CASFSv1\n`, magic last,
+so `tail -c8` identifies the format.
+
+**The name is `sha256(hash list)`.** Reading it works out in one round trip
+because `L + 32*ceil(L/cs) + 16` is strictly increasing in `L`, so a single
+stored size admits exactly one `L`: the reader derives the tail's length from
+the object size, fetches it, checks `sha256(list) == name`, and from then on
+every chunk verifies positionally against `list[i]`.
+
+Two levels, no tree, no proofs. One list therefore describes at most **131072
+chunks, 512 GB** at the 4MB default; over that the format refuses rather than
+grows a level nothing would use.
+
+**The tail is metadata and no consumer ever sees it.** `File.Size()` is `L`,
+every range lives in `[0, L)`, and the hash list and trailer are invisible above
+this package. A footer-last file format therefore seeks from `Size()`, not from
+the end of the file on disk.
+
+The trade this buys: a bucket is genuinely untrusted infrastructure. It cannot
+substitute a chunk, cannot answer with a different object of the same size, and
+cannot serve a truncated or edited hash list. **The only move it has left is to
+withhold bytes**, which is what a mirror answers.
+
 ## The spool: durability is the filesystem
 
 The store owns a spool directory. A caller adds content by atomically renaming
-a file whose name is its hex sha256 into that directory. **That rename is the
+a sealed, correctly named file into that directory. **That rename is the
 registration.** There is no handshake, no ack, no journal, no in-memory
 bookkeeping that a `kill -9` can lose. Either the rename happened or it did
 not, and the filesystem already answered that question.
 
 `Sync` scans the spool and uploads everything the bucket does not already have.
 It can run at startup, on a ticker, or right after a write; a file dropped in
-the spool by a process that then died is picked up by the next one to look. The
-bytes are hashed while they stream to S3, so a file whose name lies about its
-contents fails loudly and never pollutes a content address, without a separate
-verification pass over a multi-gigabyte file.
+the spool by a process that then died is picked up by the next one to look.
+Each upload makes ONE sequential pass over the file first, computing both the
+object digest SigV4 signs and the hash list the name commits to, so a file
+whose name lies about its contents is refused before a byte goes out. That is
+the same check on the single-PUT road and the multipart one.
 
 `Release` is the only thing that removes a spool file, and it refuses until the
 bucket is confirmed to hold the content. So a hash is never unreadable: the
@@ -48,9 +86,13 @@ difference between local and remote content:
 - the spool file is still there, so `pread` the aligned range out of it
 - it is not, so issue an aligned ranged GET
 
-Concurrent misses on one chunk collapse into a single upstream read. The bytes
-are handed back to every waiter and, if the disk has room, written to the
-current window as `<hash>.<index>` by tmp + fsync + rename.
+Concurrent misses on one chunk collapse into a single upstream read. **Every
+fill is verified against `list[i]` before it is cached or served**, and a
+mismatch is a loud error naming the artifact and the chunk index, never data. A
+cache *hit* is not re-verified: the file was verified when it was filled and
+landed by fsync + rename, and re-hashing 4MB on every hot read buys nothing.
+Verified bytes are handed back to every waiter and, if the disk has room,
+written to the current window as `<hash>.<index>` by tmp + fsync + rename.
 
 **The upload transition is invisible.** Ranges that real traffic touched while
 the file was spool-resident keep being served from the spool descriptor the
@@ -83,13 +125,19 @@ s, err := casfs.New(casfs.Config{
     CacheMaxAge: 30 * 24 * time.Hour,
 })
 
-path := s.SpoolPath(hash)       // rename your finished file onto this, yourself
-hash, err := s.Put(path)        // or let Put hash it and do the rename for you
+// Streaming producer: hash content as you write it, append the tail, rename.
+h := casfs.NewHasher(4 << 20)
+io.Copy(io.MultiWriter(file, h), content)
+name, tail, err := h.Finish()   // name == sha256(hash list); tail = list+trailer
+file.Write(tail)                // ...then fsync and rename onto SpoolPath(name)
+
+path := s.SpoolPath(name)       // rename your sealed file onto this, yourself
+name, err := s.Put(path)        // or let Put seal it and do the rename for you
 
 done, err := s.Sync()           // upload everything spooled and not yet in the bucket
 err = s.Release(hash)           // unlink the spool file, refuses until uploaded
 
-f, err := s.Open(hash)          // *File: io.ReaderAt, io.Closer, Size() int64
+f, err := s.Open(hash)          // *File: io.ReaderAt, io.Closer, Size() int64 = L
 n, err := f.ReadAt(p, off)      // the query path: pread and copy
 
 v, err := f.View(off, n)        // long-lived: one mapping per chunk
@@ -104,11 +152,12 @@ val, err := s.GetPointer("latest") // fs.ErrNotExist if absent
 st := s.Stats()                  // evictions, admission refusals, victim age, free bytes
 ```
 
-`Put` is a convenience: it hashes the file and renames it into the spool, and
-requires the file to be on the same filesystem as `SpoolDir`. A caller that
-already knows the hash (because it just computed one while writing the file)
-should skip `Put` entirely and rename onto `SpoolPath(hash)` itself. Both roads
-end at the same rename.
+`Put` is a convenience: it streams the file to build its hash list, appends the
+tail, and renames it into the spool, and requires the file to be on the same
+filesystem as `SpoolDir`. A caller that streams its own artifact should use
+`NewHasher` while it writes, append the tail `Finish` returns, and do the rename
+itself; nothing on either road holds the artifact in memory. Both end at the
+same rename.
 
 `Sync` returns the hashes now confirmed present in the bucket, so the usual
 loop is `for _, h := range done { s.Release(h) }`. Errors are collected per
@@ -204,10 +253,10 @@ memory and forgotten. Nothing is ever deleted to make room for a fill.
 
 The fill itself is tmp + **fsync** + rename. The fsync is not tuning. Power
 loss between the write and the rename must never leave a torn chunk under a
-correct name: nothing reads chunk files back with a checksum, so torn bytes
-under the right name are a silent wrong answer, and a half-written bloom page
-answers "definitely absent" for keys that are there. A tmp name never becomes a
-chunk name, so a torn write is only ever garbage to collect.
+correct name: a cache hit is not re-hashed, so torn bytes under the right name
+are a silent wrong answer, and a half-written bloom page answers "definitely
+absent" for keys that are there. A tmp name never becomes a chunk name, so a
+torn write is only ever garbage to collect.
 
 The watermark is absolute bytes, not a percentage, because casfs does not own
 the filesystem: what matters to everything else on the box is how much room is
@@ -292,9 +341,9 @@ sequential because the bottleneck is the uplink. Two S3 behaviours the code
 takes seriously: `CompleteMultipartUpload` can fail with an Error body under a
 200 OK (the status line is written before the assembly happens), and anything
 that fails after initiate leaves billable parts behind, so it aborts on the way
-out and returns the original error. Since multipart signs PARTS and not the
-whole object, the endpoint cannot catch a spool file whose name lies, so that
-path verifies the digest in one pass BEFORE it initiates.
+out and returns the original error. Multipart and single PUT send the same
+bytes and produce the same name, because the name is a function of the content
+and never of how it went up.
 
 The one AWS dependency is credential resolution, not S3: `aws-sdk-go-v2`'s
 `config`/`credentials` supply `Config.Credentials`, so SSO, instance roles and
@@ -308,11 +357,11 @@ region when `Region` is empty, before the `"auto"` fallback.
 
 ## Notes and deliberate omissions
 
-- Object sizes are not persisted. `Open` on a hash that is neither spooled nor
-  known to this process issues one HEAD and memoizes it, so a restart pays one
-  HEAD per artifact it opens and nothing else. The old sparse layout learned
-  sizes from the cache file's length; plain chunk files do not carry that, and
-  one HEAD per artifact is cheaper than an index that could go stale.
+- Artifact identity is not persisted. `Open` on a hash that is neither spooled
+  nor known to this process issues one HEAD plus one ranged read of the tail,
+  then keeps the hash list resident (32 bytes per 4MB, so 76KB for a 9.5 GB
+  artifact). That read also carries the last content chunk back, which is a
+  chunk the caller was about to ask for anyway in any footer-last format.
 - The query path opens the chunk file on every `ReadAt`. That is `open`,
   `pread`, `close`: three syscalls, no descriptor table to bound, and no cache
   to invalidate when a sibling process deletes the file underneath.
@@ -342,10 +391,16 @@ are asserted to cost exactly one GET, and eight readers running against a
 goroutine dropping whole windows in a loop are asserted to return byte-correct
 answers throughout.
 
-That signed payload hash is also the real defence against a lying spool file
-name: a compliant endpoint rejects the mismatched bytes before storing them.
-The local streaming digest turns that into a legible error and covers endpoints
-that do not verify. It is judged ONLY after the PUT succeeded: a PUT that died
-early consumed a prefix of the file, or none of it, so its digest mismatches for
-a file that is perfectly intact. The upload error wins, and an operator never
+The format has its own tests, and they are the adversarial half. A chunk whose
+bytes are substituted in place, same length and same offset under the same
+name, is asserted to be REJECTED rather than served, and never cached. A
+different artifact of exactly the same size served under this name is refused
+at open. A hash list with one flipped bit, a truncated tail and a missing
+trailer all fail. An artifact over the 131072-chunk ceiling is refused while
+exactly at the ceiling is accepted, and the short last chunk round-trips at
+every length around a boundary.
+
+An upload that FAILED is never called corruption: the file is checked in a pass
+of its own before the PUT, so a PUT that died early (expired token, dropped
+connection) reports the upload failure and nothing else. An operator never
 hears "corrupt" about content that is fine.

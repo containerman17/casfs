@@ -1,8 +1,17 @@
 // Package casfs is a content-addressed file store on top of any S3-compatible
 // bucket, with lazy chunked reads and a shared on-disk chunk cache.
 //
-// Objects are stored whole under their hex sha256, so uploads are idempotent
-// and two writers racing on the same content write identical bytes.
+// AN ARTIFACT IS SELF-AUTHENTICATING AT CHUNK GRANULARITY. Its name is
+// sha256 of its own per-chunk hash list, which the stored object carries in a
+// tail past the content (see chunked.go for the format). One small read proves
+// the list against the name, and every 4MB chunk then verifies positionally
+// against it BEFORE it is cached or served. That is what makes the bucket
+// untrusted infrastructure whose only remaining move is to withhold bytes.
+// The tail is casfs's metadata and is invisible above this package: a File is
+// L logical bytes and nothing else.
+//
+// Uploads are idempotent and two writers racing on the same content write
+// identical bytes, because both name it the same way.
 //
 // Durability lives entirely in the filesystem. A caller adds content by
 // atomically renaming a file named after its hex sha256 into the store's spool
@@ -27,6 +36,7 @@
 package casfs
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -114,9 +124,12 @@ type Store struct {
 	s3  *s3
 
 	mu sync.Mutex
-	// sizes and confirmed are caches, never the source of truth. Losing them
-	// costs one HEAD each.
-	sizes     map[string]int64
+	// arts holds each opened artifact's IDENTITY: its hash list, its logical
+	// length and its stored size. Resident for the store's life once read, at
+	// 32 bytes per 4MB (76KB for a 9.5 GB epoch, ~5MB for a whole mainnet
+	// corpus), because every chunk fill has to check against it.
+	arts map[string]*artifact
+	// confirmed is a cache, never the source of truth. Losing it costs a HEAD.
 	confirmed map[string]bool
 	// where is this process's chunk -> window hint, rebuilt by one name-only
 	// walk at startup. A stale entry costs an ENOENT and a refetch.
@@ -215,7 +228,7 @@ func New(cfg Config) (*Store, error) {
 			creds:    cfg.Credentials,
 			http:     cfg.HTTPClient,
 		},
-		sizes:     map[string]int64{},
+		arts:      map[string]*artifact{},
 		confirmed: map[string]bool{},
 		where:     map[string]string{},
 		flight:    map[string]*flight{},
@@ -269,32 +282,42 @@ func (s *Store) Close() error {
 	return nil
 }
 
-// Put hashes a local file and renames it into the spool under its hash. The
-// rename is atomic and is the entire registration, so a kill at any instant
-// leaves either the untouched original or a correctly named spool file that the
-// next Sync uploads. path must be on the same filesystem as SpoolDir.
+// Put turns a local file into an artifact: it streams the file to build the
+// chunk hash list, APPENDS the list and trailer to it, and renames it into the
+// spool under sha256(list). The rename is atomic and is the entire
+// registration, so a kill at any instant leaves either an untouched (if now
+// tail-bearing) original or a correctly named spool file that the next Sync
+// uploads. path must be on the same filesystem as SpoolDir.
 //
-// This is a convenience only. A caller that already knows the hash can do the
-// rename itself and never call into casfs at all.
+// NOTHING IS HELD IN MEMORY but the list itself. A caller that streams its own
+// artifact should use NewHasher directly, write the tail it returns, and do the
+// rename itself; this is the convenience wrapper around exactly that.
 func (s *Store) Put(path string) (string, error) {
-	f, err := os.Open(path)
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
 	if err != nil {
 		return "", err
 	}
-	h := sha256.New()
-	n, err := io.Copy(h, f)
-	f.Close()
+	defer f.Close()
+	h := NewHasher(s.cfg.ChunkSize)
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	name, tail, err := h.Finish()
 	if err != nil {
 		return "", err
 	}
-	hash := hex.EncodeToString(h.Sum(nil))
-	if err := os.Rename(path, s.SpoolPath(hash)); err != nil {
-		return "", fmt.Errorf("casfs: spool %s: %w", hash, err)
+	// io.Copy left the offset at the end of the content, which is exactly
+	// where the tail belongs.
+	if _, err := f.Write(tail); err != nil {
+		return "", err
 	}
-	s.mu.Lock()
-	s.sizes[hash] = n
-	s.mu.Unlock()
-	return hash, nil
+	if err := f.Sync(); err != nil {
+		return "", err
+	}
+	if err := os.Rename(path, s.SpoolPath(name)); err != nil {
+		return "", fmt.Errorf("casfs: spool %s: %w", name, err)
+	}
+	return name, nil
 }
 
 // Sync scans the spool and uploads every file the bucket does not already have,
@@ -336,22 +359,18 @@ func (s *Store) Sync() ([]string, error) {
 	return done, errors.Join(errs...)
 }
 
-// upload pushes one spool file, hashing the bytes as they stream past so a file
-// whose name lies about its contents is caught without a separate pass over it.
-// That same digest is what the request signature commits to through
-// x-amz-content-sha256, so a compliant endpoint rejects the mismatched bytes
-// before storing them; the local check turns that into a legible error and
-// covers endpoints that do not verify.
+// upload pushes one spool file, after ONE PASS over it that computes two
+// things at once: the object digest the request signature commits to through
+// x-amz-content-sha256, and the chunk hash list the NAME commits to. A file
+// whose name lies about its contents is refused here, before a byte goes out.
 //
-// THE DIGEST ONLY MEANS ANYTHING WHEN THE PUT SUCCEEDED (Fuji, 2026-08-04). A
-// put that dies early (expired token, dropped connection, HTTP error) consumed
-// part of the file or none of it, so the digest is over a prefix and mismatches
-// for a file that is perfectly intact. Reporting that as corruption tells an
-// operator their sealed history rotted when all that happened is a failed
-// upload, so the upload error wins and the digest is only judged after a
-// success. s3.put makes exactly one attempt and net/http cannot replay an
-// opaque body (no GetBody), so on success the hasher has seen the file once,
-// whole.
+// THE PRE-PASS IS NOT OPTIONAL ANY MORE, and it is what retired an old trap
+// (Fuji, 2026-08-04). The name is no longer the object's own sha256, so the
+// signature needs a digest that has to be computed anyway; and hashing THROUGH
+// the upload instead meant a put that died early (expired token, dropped
+// connection) produced a digest over a prefix and reported a perfectly intact
+// file as corrupt. One sequential read against an upload that takes minutes
+// buys both paths, single-PUT and multipart, the same check.
 func (s *Store) upload(hash string) error {
 	if size, err := s.s3.head(s.key(hash)); err == nil {
 		// The HEAD short-circuit is what lets Release unlink the local durable
@@ -370,9 +389,6 @@ func (s *Store) upload(hash string) error {
 			return fmt.Errorf("casfs: %s is already in the bucket at %d bytes but the spool file is %d, refusing to treat it as uploaded",
 				hash, size, fi.Size())
 		}
-		s.mu.Lock()
-		s.sizes[hash] = size
-		s.mu.Unlock()
 		return nil
 	} else if !errors.Is(err, fs.ErrNotExist) {
 		return err
@@ -387,36 +403,31 @@ func (s *Store) upload(hash string) error {
 	if err != nil {
 		return err
 	}
-	h := sha256.New()
-	src := io.TeeReader(f, h)
+	digest, err := s.checkSpool(hash, f, fi.Size())
+	if err != nil {
+		return err
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
 	// Over 5 GiB a single PUT is refused outright (EntityTooLarge), which is
-	// where a big epoch lands. Below it, the single PUT is the proven path and
-	// signs the whole-file digest, so it stays.
+	// where a big epoch lands. Both roads send exactly the bytes checkSpool
+	// just read, so THE NAME IS THE SAME EITHER WAY: the name is a function of
+	// the content, never of how it went up.
+	// LimitReader, not f itself: net/http CLOSES a request body that is an
+	// io.ReadCloser, and the descriptor is still needed afterwards to see how
+	// much the endpoint actually read.
+	src := io.LimitReader(f, fi.Size())
 	if fi.Size() > multipartThreshold {
-		// Multipart signs each PART's hash, so the endpoint never sees the
-		// whole-file digest and cannot refuse a name that lies. Check it here
-		// FIRST, or mismatched bytes would land in the bucket under a good name
-		// and the store's one integrity guarantee would be gone. One extra
-		// sequential read, against an upload that takes minutes.
-		pre := sha256.New()
-		if _, err := io.Copy(pre, f); err != nil {
-			return err
-		}
-		if got := hex.EncodeToString(pre.Sum(nil)); got != hash {
-			return fmt.Errorf("casfs: spool file %s contains content hashing to %s, refusing it", hash, got)
-		}
-		if _, err := f.Seek(0, io.SeekStart); err != nil {
-			return err
-		}
 		err = s.s3.putMultipart(s.key(hash), src, fi.Size())
 	} else {
-		err = s.s3.put(s.key(hash), src, fi.Size(), hash)
+		err = s.s3.put(s.key(hash), src, fi.Size(), digest)
 	}
 	if err != nil {
 		return err
 	}
-	// The TeeReader reads from f, so f's offset is exactly what the request
-	// consumed. A success on a short read is the endpoint's bug, not the file's.
+	// f's offset is exactly what the request consumed. A success on a short
+	// read is the endpoint's bug, not the file's.
 	read, err := f.Seek(0, io.SeekCurrent)
 	if err != nil {
 		return err
@@ -424,13 +435,40 @@ func (s *Store) upload(hash string) error {
 	if read != fi.Size() {
 		return fmt.Errorf("casfs: upload %s: endpoint accepted the put after reading %d of %d bytes", hash, read, fi.Size())
 	}
-	if got := hex.EncodeToString(h.Sum(nil)); got != hash {
-		return fmt.Errorf("casfs: spool file %s contains content hashing to %s, refusing it", hash, got)
-	}
-	s.mu.Lock()
-	s.sizes[hash] = fi.Size()
-	s.mu.Unlock()
 	return nil
+}
+
+// checkSpool reads the whole spool file once and returns the hex sha256 of the
+// STORED OBJECT (what SigV4 signs). On the way past it rebuilds the chunk hash
+// list from the content and requires the file's own tail to match it byte for
+// byte, which is the "the name is the integrity check" claim enforced at the
+// only moment it can still stop bad bytes from spreading.
+func (s *Store) checkSpool(hash string, f *os.File, stored int64) (string, error) {
+	want, err := tailLen(stored, s.cfg.ChunkSize)
+	if err != nil {
+		return "", fmt.Errorf("casfs: spool file %s: %w", hash, err)
+	}
+	obj := sha256.New()
+	lst := NewHasher(s.cfg.ChunkSize)
+	if _, err := io.Copy(io.MultiWriter(obj, lst), io.LimitReader(f, stored-want)); err != nil {
+		return "", err
+	}
+	tail := make([]byte, want)
+	if _, err := io.ReadFull(f, tail); err != nil {
+		return "", err
+	}
+	obj.Write(tail)
+	name, mine, err := lst.Finish()
+	if err != nil {
+		return "", err
+	}
+	if name != hash {
+		return "", fmt.Errorf("casfs: spool file %s holds content naming %s, refusing it", hash, name)
+	}
+	if !bytes.Equal(mine, tail) {
+		return "", fmt.Errorf("casfs: spool file %s carries a tail that does not match its own content, refusing it", hash)
+	}
+	return hex.EncodeToString(obj.Sum(nil)), nil
 }
 
 // Release drops the spool file for hash. It refuses until the bucket is
@@ -464,39 +502,124 @@ func (s *Store) Release(hash string) error {
 	return nil
 }
 
+// artifact is one stored object's IDENTITY: the hash list its name commits to,
+// the LOGICAL length of the content (what every consumer sees), and the stored
+// size including the metadata tail (what the bucket reports).
+type artifact struct {
+	hash   string
+	stored int64
+	size   int64
+	list   []byte
+}
+
+// artifact resolves and caches an artifact's identity. Resident once read, so
+// the tail is fetched at most once per artifact per process.
+func (s *Store) artifact(hash string) (*artifact, error) {
+	s.mu.Lock()
+	a := s.arts[hash]
+	s.mu.Unlock()
+	if a != nil {
+		return a, nil
+	}
+	a, err := s.readIdentity(hash)
+	if err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	s.arts[hash] = a
+	s.mu.Unlock()
+	return a, nil
+}
+
+// readIdentity reads an artifact's tail from wherever the artifact is.
+//
+// LOCALLY the file is this node's own durable copy, landed by fsync+rename, so
+// the tail is parsed for its structure and the name is not re-derived: nothing
+// untrusted has touched those bytes, and upload re-derives it anyway before
+// they can spread.
+//
+// FROM THE BUCKET the name binding is the whole point, so sha256(list) must
+// equal the name before anything else happens. That read costs ONE ranged GET,
+// which fetches the metadata tail AND THE LAST CONTENT CHUNK TOGETHER: the
+// first thing every consumer here reads is a footer at the end of the content,
+// and that chunk is a read this path was going to pay for anyway.
+func (s *Store) readIdentity(hash string) (*artifact, error) {
+	cs := s.cfg.ChunkSize
+	if size, list, err := ReadTail(s.SpoolPath(hash), cs); err == nil {
+		fi, err := os.Stat(s.SpoolPath(hash))
+		if err != nil {
+			return nil, err
+		}
+		return &artifact{hash: hash, stored: fi.Size(), size: size, list: list}, nil
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return nil, err
+	}
+	stored, err := s.s3.head(s.key(hash))
+	if err != nil {
+		return nil, err
+	}
+	want, err := tailLen(stored, cs)
+	if err != nil {
+		return nil, fmt.Errorf("casfs: %s: %w", hash, err)
+	}
+	// The tail length is derivable from the stored size alone, so the logical
+	// length and the last chunk's offset are known before the read.
+	last := nchunks(stored-want, cs) - 1
+	off := stored - want
+	if last >= 0 {
+		off = last * cs
+	}
+	body, total, err := s.s3.get(s.key(hash), off, stored-off)
+	if err != nil {
+		return nil, err
+	}
+	buf := make([]byte, stored-off)
+	_, rerr := io.ReadFull(body, buf)
+	body.Close()
+	if rerr != nil {
+		return nil, rerr
+	}
+	if total != stored {
+		return nil, fmt.Errorf("casfs: %s: the bucket's object is %d bytes, the HEAD said %d", hash, total, stored)
+	}
+	size, list, err := parseTail(stored, cs, buf[int64(len(buf))-want:])
+	if err != nil {
+		return nil, fmt.Errorf("casfs: %s: %w", hash, err)
+	}
+	if err := checkName(hash, list); err != nil {
+		return nil, err
+	}
+	if last >= 0 {
+		chunk := buf[:int64(len(buf))-want]
+		if err := VerifyChunk(hash, list, last, chunk); err != nil {
+			return nil, err
+		}
+		s.admit(chunkName(hash, last), chunk)
+	}
+	return &artifact{hash: hash, stored: stored, size: size, list: list}, nil
+}
+
 // Open returns a reader for hash. The content must be in the spool or in the
-// bucket. The only network call Open itself may make is a HEAD to learn the size
-// of an object that is neither spooled nor already known to this process.
+// bucket. Over the bucket the first open of an artifact costs a HEAD plus one
+// ranged read of its tail (and the last content chunk that shares that read);
+// after that its identity is resident and reads are chunk fetches only.
 func (s *Store) Open(hash string) (*File, error) {
 	if !validHash(hash) {
 		return nil, fmt.Errorf("casfs: open %q: not a hex sha256", hash)
 	}
+	a, err := s.artifact(hash)
+	if err != nil {
+		return nil, err
+	}
 	if f, err := os.Open(s.SpoolPath(hash)); err == nil {
-		fi, err := f.Stat()
-		if err != nil {
-			f.Close()
-			return nil, err
-		}
 		// The descriptor is held for the File's life, so a Release that unlinks
 		// the spool file underneath does not disturb reads already going
 		// through it.
-		return &File{s: s, hash: hash, size: fi.Size(), spool: f}, nil
+		return &File{s: s, a: a, spool: f}, nil
 	} else if !errors.Is(err, fs.ErrNotExist) {
 		return nil, err
 	}
-	s.mu.Lock()
-	size, known := s.sizes[hash]
-	s.mu.Unlock()
-	if !known {
-		var err error
-		if size, err = s.s3.head(s.key(hash)); err != nil {
-			return nil, err
-		}
-		s.mu.Lock()
-		s.sizes[hash] = size
-		s.mu.Unlock()
-	}
-	return &File{s: s, hash: hash, size: size}, nil
+	return &File{s: s, a: a}, nil
 }
 
 // SetPointer writes a small mutable value at name. It is LOCAL AND
@@ -680,15 +803,17 @@ func checkPointer(name string) error {
 // this artifact was still local when it was opened.
 type File struct {
 	s     *Store
-	hash  string
-	size  int64
+	a     *artifact
 	spool *os.File // non-nil while the artifact is still spool-resident
 
 	mu sync.Mutex
-	mm []byte // whole-file mapping of the spool file, built by the first View
+	mm []byte // mapping of the spool file's CONTENT, built by the first View
 }
 
-func (f *File) Size() int64 { return f.size }
+// Size is the artifact's LOGICAL length: the content, without the hash list and
+// trailer casfs keeps past it. No consumer ever sees those, which is why a
+// footer-last format seeks from Size rather than from the file's end.
+func (f *File) Size() int64 { return f.a.size }
 
 // Close releases the spool mapping and descriptor. CLOSE EVERY VIEW FIRST: a
 // view of a spool-resident artifact is a window onto the mapping this owns, so
@@ -708,8 +833,8 @@ func (f *File) Close() error {
 }
 
 func (f *File) bounds(off, n int64) error {
-	if off < 0 || n < 0 || off+n > f.size {
-		return fmt.Errorf("casfs: range [%d,%d) outside a %d byte object", off, off+n, f.size)
+	if off < 0 || n < 0 || off+n > f.a.size {
+		return fmt.Errorf("casfs: range [%d,%d) outside a %d byte object", off, off+n, f.a.size)
 	}
 	return nil
 }
@@ -724,20 +849,29 @@ func (f *File) ReadAt(p []byte, off int64) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
 	}
-	if off >= f.size {
+	if off >= f.a.size {
 		return 0, io.EOF
 	}
 	if f.spool != nil {
+		// Clamped to the CONTENT: past it lies casfs's own metadata, which a
+		// consumer must never be handed as if it were the file's bytes.
+		if int64(len(p)) > f.a.size-off {
+			n, err := f.spool.ReadAt(p[:f.a.size-off], off)
+			if err == nil {
+				err = io.EOF
+			}
+			return n, err
+		}
 		return f.spool.ReadAt(p, off)
 	}
 	cs := f.s.cfg.ChunkSize
 	n := 0
-	for n < len(p) && off+int64(n) < f.size {
+	for n < len(p) && off+int64(n) < f.a.size {
 		cur := off + int64(n)
 		idx := cur / cs
 		// Clamp to the chunk: past its end lies a different file.
-		want := min(int64(len(p)-n), chunkLen(f.size, cs, idx)-cur%cs)
-		m, err := f.s.readChunk(f.hash, f.size, idx, p[n:n+int(want)], cur%cs)
+		want := min(int64(len(p)-n), chunkLen(f.a.size, cs, idx)-cur%cs)
+		m, err := f.s.readChunk(f.a, idx, p[n:n+int(want)], cur%cs)
 		n += m
 		if err != nil {
 			return n, err
@@ -755,8 +889,8 @@ func (f *File) ReadAt(p []byte, off int64) (int, error) {
 // readChunk preads out of one cached chunk, fetching it first if it is not
 // here. A cached file that reads short is treated as a miss and refetched: it
 // cannot happen (fills fsync before the rename) and costs one GET if it does.
-func (s *Store) readChunk(hash string, size, idx int64, p []byte, off int64) (int, error) {
-	name := chunkName(hash, idx)
+func (s *Store) readChunk(a *artifact, idx int64, p []byte, off int64) (int, error) {
+	name := chunkName(a.hash, idx)
 	cf, err := s.openChunk(name)
 	if err != nil {
 		return 0, err
@@ -768,7 +902,7 @@ func (s *Store) readChunk(hash string, size, idx int64, p []byte, off int64) (in
 			return n, nil
 		}
 	}
-	b, err := s.fetch(hash, size, idx)
+	b, err := s.fetch(a, idx)
 	if err != nil {
 		return 0, err
 	}
@@ -796,7 +930,8 @@ func (f *File) View(off, n int64) (*View, error) {
 		f.mu.Lock()
 		defer f.mu.Unlock()
 		if f.mm == nil {
-			b, err := mapFile(f.spool, f.size)
+			// The CONTENT only: the tail is not part of the logical file.
+			b, err := mapFile(f.spool, f.a.size)
 			if err != nil {
 				return nil, err
 			}
@@ -809,7 +944,7 @@ func (f *File) View(off, n int64) (*View, error) {
 	cs := f.s.cfg.ChunkSize
 	v := &View{first: off % cs, n: n, cs: cs}
 	for i := off / cs; i <= (off+n-1)/cs; i++ {
-		b, mapped, err := f.s.chunkView(f.hash, f.size, i)
+		b, mapped, err := f.s.chunkView(f.a, i)
 		if err != nil {
 			v.Close()
 			return nil, err
@@ -825,9 +960,9 @@ func (f *File) View(off, n int64) (*View, error) {
 // chunkView hands back one chunk's bytes for the life of a View: a mapping of
 // the cache file when it is there, and the fetched bytes on the heap when the
 // disk was over the watermark and refused them.
-func (s *Store) chunkView(hash string, size, idx int64) ([]byte, bool, error) {
-	name := chunkName(hash, idx)
-	n := chunkLen(size, s.cfg.ChunkSize, idx)
+func (s *Store) chunkView(a *artifact, idx int64) ([]byte, bool, error) {
+	name := chunkName(a.hash, idx)
+	n := chunkLen(a.size, s.cfg.ChunkSize, idx)
 	if cf, err := s.openChunk(name); err != nil {
 		return nil, false, err
 	} else if cf != nil {
@@ -837,7 +972,7 @@ func (s *Store) chunkView(hash string, size, idx int64) ([]byte, bool, error) {
 			return b, true, nil
 		}
 	}
-	b, err := s.fetch(hash, size, idx)
+	b, err := s.fetch(a, idx)
 	if err != nil {
 		return nil, false, err
 	}

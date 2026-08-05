@@ -281,11 +281,17 @@ type flight struct {
 	err error
 }
 
-// fetch reads one chunk from the durable copy and caches it if the disk has
-// room. The returned bytes are shared with every other waiter and are
-// READ-ONLY.
-func (s *Store) fetch(hash string, size, idx int64) ([]byte, error) {
-	name := chunkName(hash, idx)
+// fetch reads one chunk from the durable copy, VERIFIES IT AGAINST THE
+// ARTIFACT'S OWN HASH LIST, and caches it if the disk has room. The returned
+// bytes are shared with every other waiter and are READ-ONLY.
+//
+// THE VERIFICATION IS THE POINT OF THE WHOLE FORMAT and it happens HERE, on
+// the fill, before the bytes are cached or handed to anyone. A cache HIT is
+// not re-verified: the cached file was verified when it was filled and landed
+// by fsync+rename, and re-hashing 4MB on every hot read is a cost with nothing
+// to buy.
+func (s *Store) fetch(a *artifact, idx int64) ([]byte, error) {
+	name := chunkName(a.hash, idx)
 	s.mu.Lock()
 	if fl, ok := s.flight[name]; ok {
 		s.mu.Unlock()
@@ -297,9 +303,14 @@ func (s *Store) fetch(hash string, size, idx int64) ([]byte, error) {
 	s.flight[name] = fl
 	s.mu.Unlock()
 
-	fl.b, fl.err = s.pull(hash, size, idx)
+	fl.b, fl.err = s.pull(a, idx)
 	if fl.err == nil {
-		s.admit(name, fl.b)
+		if err := VerifyChunk(a.hash, a.list, idx, fl.b); err != nil {
+			s.note(&s.fillErrors, "verify "+name, err)
+			fl.b, fl.err = nil, err
+		} else {
+			s.admit(name, fl.b)
+		}
 	}
 	s.mu.Lock()
 	delete(s.flight, name)
@@ -311,11 +322,11 @@ func (s *Store) fetch(hash string, size, idx int64) ([]byte, error) {
 // pull reads a chunk's bytes from the spool file when the artifact is still
 // local and by a ranged GET when it is not. That is the only respect in which
 // spooled and remote content differ anywhere.
-func (s *Store) pull(hash string, size, idx int64) ([]byte, error) {
+func (s *Store) pull(a *artifact, idx int64) ([]byte, error) {
 	off := idx * s.cfg.ChunkSize
-	n := chunkLen(size, s.cfg.ChunkSize, idx)
+	n := chunkLen(a.size, s.cfg.ChunkSize, idx)
 	b := make([]byte, n)
-	if f, err := os.Open(s.SpoolPath(hash)); err == nil {
+	if f, err := os.Open(s.SpoolPath(a.hash)); err == nil {
 		defer f.Close()
 		if _, err := f.ReadAt(b, off); err != nil {
 			return nil, err
@@ -324,17 +335,17 @@ func (s *Store) pull(hash string, size, idx int64) ([]byte, error) {
 	} else if !errors.Is(err, fs.ErrNotExist) {
 		return nil, err
 	}
-	body, total, err := s.s3.get(s.key(hash), off, n)
+	body, total, err := s.s3.get(s.key(a.hash), off, n)
 	if err != nil {
 		return nil, err
 	}
 	defer body.Close()
-	// The chunk layout is derived from size, so an object that is not that
-	// size is not the object these chunks were counted for. s3.get has already
-	// checked the range STARTS where it was asked to; this is the other half.
-	if total != size {
+	// A cheap early-out on the wrong object. It is no longer the integrity
+	// check (fetch hashes these bytes against the artifact's own list), but a
+	// size mismatch names the failure better than a hash mismatch does.
+	if total != a.stored {
 		return nil, fmt.Errorf("casfs: chunk %d of %s: the bucket's object is %d bytes, this store expected %d",
-			idx, hash, total, size)
+			idx, a.hash, total, a.stored)
 	}
 	if _, err := io.ReadFull(body, b); err != nil {
 		return nil, err
