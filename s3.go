@@ -382,6 +382,47 @@ type completeUpload struct {
 	Parts   []completedPart `xml:"Part"`
 }
 
+// anyObject reports whether one object exists under prefix, as a ListObjectsV2
+// with max-keys=1. Contents is what is counted rather than the KeyCount field,
+// because V1 has no KeyCount and not every S3-compatible server sends one.
+func (c *s3) anyObject(prefix string) (bool, error) {
+	u, err := c.urlFor("")
+	if err != nil {
+		return false, err
+	}
+	// Sorted and encoded by Values.Encode, which is the canonical query string
+	// sign() commits to verbatim.
+	u.RawQuery = url.Values{"list-type": {"2"}, "max-keys": {"1"}, "prefix": {prefix}}.Encode()
+	req, err := http.NewRequest(http.MethodGet, u.String(), nil)
+	if err != nil {
+		return false, err
+	}
+	if err := c.sign(req, emptySHA256, time.Now()); err != nil {
+		return false, err
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return false, fmt.Errorf("casfs: list %s: %w", prefix, err)
+	}
+	if resp.StatusCode/100 != 2 {
+		return false, httpErr("list "+prefix, resp)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	resp.Body.Close()
+	if err != nil {
+		return false, fmt.Errorf("casfs: list %s: %w", prefix, err)
+	}
+	var res struct {
+		Contents []struct {
+			Key string `xml:"Key"`
+		} `xml:"Contents"`
+	}
+	if err := xml.Unmarshal(body, &res); err != nil {
+		return false, fmt.Errorf("casfs: list %s: unreadable response %q", prefix, body)
+	}
+	return len(res.Contents) > 0, nil
+}
+
 func (c *s3) getAll(key string) ([]byte, error) {
 	body, _, err := c.get(key, 0, 0)
 	if err != nil {

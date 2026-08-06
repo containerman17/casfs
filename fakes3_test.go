@@ -114,6 +114,10 @@ func (f *fakeS3) serve(w http.ResponseWriter, r *http.Request) {
 	if f.serveMultipart(w, r, key) {
 		return
 	}
+	if r.URL.Query().Get("list-type") == "2" {
+		f.serveList(w, r)
+		return
+	}
 
 	switch r.Method {
 	case http.MethodPut:
@@ -193,6 +197,29 @@ func (f *fakeS3) serve(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.Error(w, "<Error><Code>MethodNotAllowed</Code></Error>", http.StatusMethodNotAllowed)
 	}
+}
+
+// serveList answers ListObjectsV2, honouring prefix and max-keys, which is all
+// anyObject asks of it.
+func (f *fakeS3) serveList(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	maxKeys, err := strconv.Atoi(q.Get("max-keys"))
+	if err != nil || maxKeys <= 0 {
+		maxKeys = 1000
+	}
+	f.mu.Lock()
+	var keys []string
+	for k := range f.objects {
+		if strings.HasPrefix(k, q.Get("prefix")) && len(keys) < maxKeys {
+			keys = append(keys, k)
+		}
+	}
+	f.mu.Unlock()
+	fmt.Fprintf(w, "<ListBucketResult><KeyCount>%d</KeyCount>", len(keys))
+	for _, k := range keys {
+		fmt.Fprintf(w, "<Contents><Key>%s</Key></Contents>", k)
+	}
+	fmt.Fprint(w, "</ListBucketResult>")
 }
 
 // serveMultipart answers initiate / part / complete / abort, and reports

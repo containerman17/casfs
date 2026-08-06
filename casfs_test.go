@@ -1310,6 +1310,66 @@ func TestSyncUploadsContentBeforePointers(t *testing.T) {
 	}
 }
 
+// TestSpoolPointerWrittenWithoutAStore is the offline producer: a process with
+// no credentials has no Store at all, so the pointer it writes has to be
+// findable by the credentialed process that comes later. WriteSpoolPointer puts
+// it where New's scan looks, and the first Sync after that publishes it with
+// the ordering intact, WITHOUT the producer authoring a new value.
+func TestSpoolPointerWrittenWithoutAStore(t *testing.T) {
+	f := newFakeS3(t)
+	root := t.TempDir()
+	spoolDir := filepath.Join(root, "spool")
+
+	// No store exists yet: this is the no-credentials process.
+	if err := WriteSpoolPointer(spoolDir, "latest-abc", "epoch deadbeef\n"); err != nil {
+		t.Fatal(err)
+	}
+	// And a name that would collide with the content-address space is refused
+	// here exactly as it is on a store.
+	if err := WriteSpoolPointer(spoolDir, strings.Repeat("a", 64), "x"); err == nil {
+		t.Fatal("a hash-shaped pointer name was accepted")
+	}
+
+	s := newStore(t, f, "epoch/", 1024, func(c *Config) { c.SpoolDir = spoolDir })
+	data := randBytes(2000, 7)
+	spool(t, s, hashOf(t, s, data), data)
+	mustSync(t, s)
+
+	f.mu.Lock()
+	puts := append([]string(nil), f.puts...)
+	got := string(f.objects["epoch/latest-abc"])
+	f.mu.Unlock()
+	if got != "epoch deadbeef\n" {
+		t.Fatalf("bucket pointer = %q, want the value the offline process wrote", got)
+	}
+	if len(puts) != 2 || puts[1] != "epoch/latest-abc" {
+		t.Fatalf("PUT order %v, want the artifact then the pointer", puts)
+	}
+}
+
+// TestPrefixHasObjects: the one question that separates "nobody has published
+// here" from "somebody has, and the pointer is missing".
+func TestPrefixHasObjects(t *testing.T) {
+	f := newFakeS3(t)
+	s := newStore(t, f, "epoch/", 1024)
+	if has, err := s.PrefixHasObjects(); err != nil || has {
+		t.Fatalf("empty prefix: has=%v err=%v", has, err)
+	}
+	// A sibling prefix is not this one.
+	f.mu.Lock()
+	f.objects["other/thing"] = []byte("x")
+	f.mu.Unlock()
+	if has, err := s.PrefixHasObjects(); err != nil || has {
+		t.Fatalf("another prefix's object counted: has=%v err=%v", has, err)
+	}
+	data := randBytes(2000, 3)
+	spool(t, s, hashOf(t, s, data), data)
+	mustSync(t, s)
+	if has, err := s.PrefixHasObjects(); err != nil || !has {
+		t.Fatalf("after an upload: has=%v err=%v", has, err)
+	}
+}
+
 // TestGetPointerFallsBackToBucket is the fresh consumer: it has never written
 // this name, so the only copy is the bucket's, and a bucket that cannot be
 // read is an error, never a guess.

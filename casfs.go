@@ -282,6 +282,20 @@ func validHash(h string) bool {
 
 func (s *Store) key(hash string) string { return s.cfg.Prefix + hash }
 
+// PrefixHasObjects reports whether the bucket holds ANY object under this
+// store's prefix. One ListObjectsV2 capped at a single key, so it costs the
+// same on an empty prefix as on a full one.
+//
+// It exists for one question a caller cannot otherwise ask: a prefix that holds
+// content is a prefix somebody has published to, whatever else is or is not in
+// it. A missing pointer over a POPULATED prefix is therefore evidence of a
+// broken or mis-typed publish, while a missing pointer over an EMPTY one is
+// just a chain nobody has started yet. It needs s3:ListBucket, and an error
+// here is an error, never a "no".
+func (s *Store) PrefixHasObjects() (bool, error) {
+	return s.s3.anyObject(s.cfg.Prefix)
+}
+
 // SpoolPath is where a file named after hash must land to be registered.
 // Callers that produce content themselves can write next to it and rename onto
 // this path; that rename is all the registration there is.
@@ -717,12 +731,26 @@ func (s *Store) pointerPath(name string) string {
 
 // writePointer lands a value by tmp+fsync+rename, so a kill leaves either the
 // old value or the new one. Callers hold ptrMu.
+func (s *Store) writePointer(name, value string) error {
+	return WriteSpoolPointer(s.cfg.SpoolDir, name, value)
+}
+
+// WriteSpoolPointer lands a pointer value in a spool directory WITHOUT A STORE,
+// which is the whole point of it being exported: a producer running with no
+// credentials has no store at all, and a pointer it writes anywhere else is a
+// pointer no later, credentialed process will ever upload. New's scanPointers
+// walks exactly this directory to rebuild its dirty set, so a value left here
+// while offline goes up on the first Sync after the keys arrive, still under
+// the content-before-pointer ordering.
 //
 // THE FSYNC IS THE DURABILITY, not the rename. Without it power loss can leave
 // a renamed but zero-length file, and an empty pointer value is not obviously
 // invalid to a reader: epochdb decodes one as "this chain has no epochs".
-func (s *Store) writePointer(name, value string) error {
-	p := s.pointerPath(name)
+func WriteSpoolPointer(spoolDir, name, value string) error {
+	if err := checkPointer(name); err != nil {
+		return err
+	}
+	p := filepath.Join(spoolDir, pointerDir, filepath.FromSlash(name))
 	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
 		return err
 	}
